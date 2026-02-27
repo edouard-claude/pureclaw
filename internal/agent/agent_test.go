@@ -74,7 +74,7 @@ func testWorkspace(t *testing.T) *workspace.Workspace {
 	return &workspace.Workspace{
 		Root:    t.TempDir(),
 		SoulMD:  "You are a test agent.",
-		AgentMD: "# Test Agent",
+		AgentMD: "# Test Agent\n\n## Environment\n\n- **OS:** test",
 	}
 }
 

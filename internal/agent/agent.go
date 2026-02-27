@@ -65,6 +65,15 @@ func New(cfg NewAgentConfig) *Agent {
 // Run starts the event loop, processing messages sequentially until the context is cancelled.
 func (a *Agent) Run(ctx context.Context, messages <-chan telegram.TelegramMessage) error {
 	slog.Info("event loop started", "component", "agent", "operation", "run")
+
+	if err := a.runIntrospectionIfNeeded(ctx); err != nil {
+		slog.Warn("introspection failed",
+			"component", "agent",
+			"operation", "introspection",
+			"error", err,
+		)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
