@@ -36,15 +36,13 @@ func TestRun_unknownCommand(t *testing.T) {
 	}
 }
 
-func TestRun_unimplementedCommands(t *testing.T) {
-	cmds := []string{"run"}
-	for _, cmd := range cmds {
-		t.Run(cmd, func(t *testing.T) {
-			code := run([]string{"pureclaw", cmd}, strings.NewReader(""), io.Discard, io.Discard)
-			if code != 1 {
-				t.Fatalf("expected exit code 1 for unimplemented %q, got %d", cmd, code)
-			}
-		})
+func TestRun_runDelegation(t *testing.T) {
+	// "run" with no config.json returns 1 (config load error).
+	dir := t.TempDir()
+	chdir(t, dir)
+	code := run([]string{"pureclaw", "run"}, strings.NewReader(""), io.Discard, io.Discard)
+	if code != 1 {
+		t.Fatalf("expected exit code 1 (no config), got %d", code)
 	}
 }
 

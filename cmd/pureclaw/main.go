@@ -25,8 +25,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	case "init":
 		return runInit(stdin, stdout, stderr)
 	case "run":
-		fmt.Fprintln(stderr, "run: not yet implemented")
-		return 1
+		return runAgent(stdin, stdout, stderr)
 	case "vault":
 		if len(args) < 3 {
 			printVaultUsage(stderr)
