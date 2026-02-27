@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/edouard/pureclaw/internal/llm"
+	"github.com/edouard/pureclaw/internal/subagent"
 	"github.com/edouard/pureclaw/internal/telegram"
 	"github.com/edouard/pureclaw/internal/tool"
 	"github.com/edouard/pureclaw/internal/workspace"
@@ -1816,5 +1820,335 @@ func TestHandleMessage_VoiceEmptyTranscription(t *testing.T) {
 	// No error message sent either (empty is not an error, just skip).
 	if len(sender.sent) != 0 {
 		t.Errorf("sent messages = %d, want 0 (empty transcription skipped)", len(sender.sent))
+	}
+}
+
+// --- Sub-Agent Tests ---
+
+func TestRun_SubAgentResult(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hi")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	// Send a sub-agent result.
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "test-task",
+		WorkspacePath: "/tmp/workspace",
+		ResultContent: "task result",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// Verify memory was logged.
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" && strings.Contains(e.content, "test-task") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent-result memory entry")
+	}
+}
+
+func TestRun_SubAgentResultTimedOut(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Memory:          mem,
+		SubAgentResults: subResults,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:   "timeout-task",
+		TimedOut: true,
+		Err:      errors.New("timed out"),
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" && strings.Contains(e.content, "timed out") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent timed out memory entry")
+	}
+}
+
+func TestRun_SubAgentResultError(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Memory:          mem,
+		SubAgentResults: subResults,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID: "error-task",
+		Err:    errors.New("process crashed"),
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" && strings.Contains(e.content, "failed") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent failed memory entry")
+	}
+}
+
+func TestRun_NilSubAgentChannel(t *testing.T) {
+	// When SubAgentResults is nil, the event loop works normally without panic.
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		SubAgentResults: nil, // explicitly nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "test"))
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(sender.sent))
+	}
+}
+
+func TestRunSubAgent_Success(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{
+		makeResponse("message", "the result"),
+	}}
+	mem := &fakeMemoryWriter{}
+
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       llmFake,
+		Memory:    mem,
+	})
+
+	err := ag.RunSubAgent(context.Background())
+	if err != nil {
+		t.Fatalf("RunSubAgent() error = %v", err)
+	}
+
+	// Verify result.md was written.
+	resultPath := filepath.Join(ws.Root, "result.md")
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result.md: %v", err)
+	}
+	if string(data) != "the result" {
+		t.Errorf("result.md = %q, want %q", string(data), "the result")
+	}
+}
+
+func TestRunSubAgent_EmptyMission(t *testing.T) {
+	ws := testWorkspace(t)
+	ws.AgentMD = "" // No mission
+	llmFake := &fakeLLM{}
+
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       llmFake,
+	})
+
+	err := ag.RunSubAgent(context.Background())
+	if err == nil {
+		t.Fatal("expected error for empty mission")
+	}
+	if !strings.Contains(err.Error(), "no AGENT.md mission") {
+		t.Errorf("error = %q, want to contain 'no AGENT.md mission'", err)
+	}
+}
+
+func TestRunSubAgent_LLMError(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{errs: []error{errors.New("API down")}}
+
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       llmFake,
+	})
+
+	err := ag.RunSubAgent(context.Background())
+	if err == nil {
+		t.Fatal("expected error for LLM failure")
+	}
+	if !strings.Contains(err.Error(), "LLM call failed") {
+		t.Errorf("error = %q, want to contain 'LLM call failed'", err)
+	}
+}
+
+func TestRunSubAgent_WithToolCalls(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "read_file", `{"path":"test.txt"}`)),
+			makeResponse("message", "tool result written"),
+		},
+	}
+	executor := &fakeToolExecutor{
+		results: []tool.ToolResult{
+			{Success: true, Output: "file content"},
+		},
+		definitions: []llm.Tool{},
+	}
+	mem := &fakeMemoryWriter{}
+
+	ag := New(NewAgentConfig{
+		Workspace:    ws,
+		LLM:          llmFake,
+		Memory:       mem,
+		ToolExecutor: executor,
+	})
+
+	err := ag.RunSubAgent(context.Background())
+	if err != nil {
+		t.Fatalf("RunSubAgent() error = %v", err)
+	}
+
+	// Tool was executed.
+	if len(executor.calls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(executor.calls))
+	}
+
+	// Result was written.
+	data, err := os.ReadFile(filepath.Join(ws.Root, "result.md"))
+	if err != nil {
+		t.Fatalf("read result.md: %v", err)
+	}
+	if string(data) != "tool result written" {
+		t.Errorf("result.md = %q, want %q", string(data), "tool result written")
+	}
+}
+
+func TestRun_SubAgentResultTimedOutWithPartialResult(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Memory:          mem,
+		SubAgentResults: subResults,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "timeout-partial",
+		TimedOut:      true,
+		Err:           errors.New("timed out"),
+		ResultContent: "partial work done",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" && strings.Contains(e.content, "partial result collected") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent timed out with partial result memory entry")
+	}
+}
+
+func TestRunSubAgent_ExhaustedToolRounds(t *testing.T) {
+	ws := testWorkspace(t)
+	// LLM always returns tool calls, never a final text response.
+	responses := make([]*llm.ChatResponse, maxToolRounds)
+	for i := range responses {
+		responses[i] = makeToolCallResponse(tc("call_"+fmt.Sprintf("%d", i), "read_file", `{"path":"test.txt"}`))
+	}
+	llmFake := &fakeLLM{responses: responses}
+	executor := &fakeToolExecutor{
+		results:     []tool.ToolResult{{Success: true, Output: "ok"}},
+		definitions: []llm.Tool{},
+	}
+
+	ag := New(NewAgentConfig{
+		Workspace:    ws,
+		LLM:          llmFake,
+		ToolExecutor: executor,
+	})
+
+	err := ag.RunSubAgent(context.Background())
+	if err == nil {
+		t.Fatal("expected error when tool rounds exhausted")
+	}
+	if !strings.Contains(err.Error(), "exhausted") {
+		t.Errorf("error = %q, want to contain 'exhausted'", err)
 	}
 }

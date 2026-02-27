@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/edouard/pureclaw/internal/llm"
 	"github.com/edouard/pureclaw/internal/memory"
+	"github.com/edouard/pureclaw/internal/platform"
+	"github.com/edouard/pureclaw/internal/subagent"
 	"github.com/edouard/pureclaw/internal/telegram"
 	"github.com/edouard/pureclaw/internal/tool"
 	"github.com/edouard/pureclaw/internal/workspace"
@@ -64,32 +67,34 @@ type VoiceDownloader interface {
 
 // NewAgentConfig holds all dependencies for Agent construction.
 type NewAgentConfig struct {
-	Workspace      *workspace.Workspace
-	LLM            LLMClient
-	Sender         Sender
-	Memory         MemoryWriter
-	MemorySearcher MemorySearcher
-	ToolExecutor   ToolExecutor
+	Workspace       *workspace.Workspace
+	LLM             LLMClient
+	Sender          Sender
+	Memory          MemoryWriter
+	MemorySearcher  MemorySearcher
+	ToolExecutor    ToolExecutor
 	FileChanges     <-chan struct{}
 	HeartbeatTick   <-chan time.Time
 	Heartbeat       HeartbeatExecutor
 	Transcriber     Transcriber
 	VoiceDownloader VoiceDownloader
+	SubAgentResults <-chan subagent.SubAgentResult
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
 type Agent struct {
-	workspace      *workspace.Workspace
-	llm            LLMClient
-	sender         Sender
-	memory         MemoryWriter
-	memorySearcher MemorySearcher
-	toolExecutor   ToolExecutor
+	workspace       *workspace.Workspace
+	llm             LLMClient
+	sender          Sender
+	memory          MemoryWriter
+	memorySearcher  MemorySearcher
+	toolExecutor    ToolExecutor
 	fileChanges     <-chan struct{}
 	heartbeatTick   <-chan time.Time
 	heartbeat       HeartbeatExecutor
 	transcriber     Transcriber
 	voiceDownloader VoiceDownloader
+	subAgentResults <-chan subagent.SubAgentResult
 	history         []llm.Message
 }
 
@@ -107,6 +112,7 @@ func New(cfg NewAgentConfig) *Agent {
 		heartbeat:       cfg.Heartbeat,
 		transcriber:     cfg.Transcriber,
 		voiceDownloader: cfg.VoiceDownloader,
+		subAgentResults: cfg.SubAgentResults,
 	}
 }
 
@@ -133,6 +139,8 @@ func (a *Agent) Run(ctx context.Context, messages <-chan telegram.TelegramMessag
 			a.handleFileChange(ctx)
 		case <-a.heartbeatTick:
 			a.handleHeartbeat(ctx)
+		case result := <-a.subAgentResults:
+			a.handleSubAgentResult(ctx, result)
 		}
 	}
 }
@@ -394,6 +402,118 @@ func (a *Agent) transcribeVoice(ctx context.Context, fileID string) (string, err
 	}
 
 	return text, nil
+}
+
+// handleSubAgentResult processes the result of a completed sub-agent.
+func (a *Agent) handleSubAgentResult(ctx context.Context, result subagent.SubAgentResult) {
+	slog.Info("sub-agent completed",
+		"component", "agent", "operation", "handle_sub_agent_result",
+		"task_id", result.TaskID, "timed_out", result.TimedOut,
+		"has_result", result.ResultContent != "")
+
+	var entry string
+	if result.TimedOut {
+		if result.ResultContent != "" {
+			entry = fmt.Sprintf("Sub-agent '%s' timed out but partial result collected (%d bytes).", result.TaskID, len(result.ResultContent))
+		} else {
+			entry = fmt.Sprintf("Sub-agent '%s' timed out. No result collected.", result.TaskID)
+		}
+	} else if result.Err != nil {
+		entry = fmt.Sprintf("Sub-agent '%s' failed: %s", result.TaskID, result.Err)
+	} else {
+		entry = fmt.Sprintf("Sub-agent '%s' completed successfully.", result.TaskID)
+	}
+	a.logMemory(ctx, "sub-agent-result", entry)
+}
+
+// RunSubAgent runs the agent in autonomous sub-agent mode.
+// It reads the mission from AGENT.md, processes it through the LLM pipeline,
+// and writes the result to result.md in the workspace root.
+func (a *Agent) RunSubAgent(ctx context.Context) error {
+	slog.Info("sub-agent autonomous mode started",
+		"component", "agent", "operation", "run_subagent")
+
+	mission := a.workspace.AgentMD
+	if mission == "" {
+		return fmt.Errorf("no AGENT.md mission found in workspace")
+	}
+
+	// Build messages with mission as user message.
+	msgs := a.buildMessages(mission)
+	tools := a.toolDefinitions()
+
+	var lastContent string
+	exhausted := true
+
+	for round := range maxToolRounds {
+		resp, err := a.llm.ChatCompletionWithRetry(ctx, msgs, tools)
+		if err != nil {
+			return fmt.Errorf("LLM call failed (round %d): %w", round+1, err)
+		}
+
+		if len(resp.Choices) == 0 {
+			return fmt.Errorf("LLM returned no choices (round %d)", round+1)
+		}
+
+		if !llm.HasToolCalls(&resp.Choices[0]) {
+			lastContent = resp.Choices[0].Message.Content
+			exhausted = false
+			break
+		}
+
+		if a.toolExecutor == nil {
+			return fmt.Errorf("LLM returned tool calls but no executor configured")
+		}
+
+		toolMsgs := a.executeToolCalls(ctx, resp.Choices[0].Message)
+		msgs = append(msgs, resp.Choices[0].Message)
+		msgs = append(msgs, toolMsgs...)
+
+		slog.Info("sub-agent tool round completed",
+			"component", "agent", "operation", "run_subagent",
+			"round", round+1,
+			"tool_calls", len(resp.Choices[0].Message.ToolCalls))
+	}
+
+	// Check if tool rounds were exhausted without a final text response.
+	if exhausted {
+		slog.Warn("sub-agent exhausted tool rounds without producing a result",
+			"component", "agent", "operation", "run_subagent",
+			"max_rounds", maxToolRounds)
+		return fmt.Errorf("sub-agent exhausted %d tool rounds without producing a result", maxToolRounds)
+	}
+
+	// Parse the LLM response to extract content.
+	if lastContent != "" {
+		agentResp, err := llm.ParseAgentResponse(lastContent)
+		if err != nil {
+			slog.Warn("failed to parse sub-agent response, using raw content",
+				"component", "agent", "operation", "run_subagent",
+				"error", err)
+			// Keep lastContent as-is (raw LLM output as fallback).
+		} else {
+			lastContent = agentResp.Content
+		}
+	}
+
+	// Write result.md via AtomicWrite.
+	resultPath := filepath.Join(a.workspace.Root, "result.md")
+	if lastContent != "" {
+		if err := platform.AtomicWrite(resultPath, []byte(lastContent), 0644); err != nil {
+			return fmt.Errorf("write result.md: %w", err)
+		}
+		slog.Info("sub-agent result written",
+			"component", "agent", "operation", "run_subagent",
+			"path", resultPath, "bytes", len(lastContent))
+	} else {
+		slog.Warn("sub-agent completed without generating a result",
+			"component", "agent", "operation", "run_subagent")
+	}
+
+	a.logMemory(ctx, "sub-agent", "Mission completed")
+	slog.Info("sub-agent autonomous mode completed",
+		"component", "agent", "operation", "run_subagent")
+	return nil
 }
 
 func (a *Agent) logMemory(ctx context.Context, source, content string) {

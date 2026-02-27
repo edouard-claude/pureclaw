@@ -14,6 +14,7 @@ import (
 	"github.com/edouard/pureclaw/internal/agent"
 	"github.com/edouard/pureclaw/internal/config"
 	"github.com/edouard/pureclaw/internal/heartbeat"
+	"github.com/edouard/pureclaw/internal/subagent"
 	"github.com/edouard/pureclaw/internal/llm"
 	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
@@ -183,6 +184,9 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		)
 	}
 
+	// 6f. Create sub-agent result channel for event loop integration.
+	subAgentResults := make(chan subagent.SubAgentResult, 1)
+
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
 		Workspace:       ws,
@@ -196,7 +200,10 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		Heartbeat:       hb,
 		Transcriber:     audioClient,
 		VoiceDownloader: tgClient,
+		SubAgentResults: subAgentResults,
 	})
+	// Store subAgentResults channel for later use by spawn_agent tool (Story 6.3).
+	_ = subAgentResults
 
 	// 8. Signal handling
 	ctx, stop := signalContext()

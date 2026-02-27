@@ -87,6 +87,100 @@ func TestRun_vaultSubcommandDelegation(t *testing.T) {
 	}
 }
 
+func TestParseAgentFlags_WithAgent(t *testing.T) {
+	agentPath, configPath, vaultPath, err := parseAgentFlags([]string{"--agent", "/path/to/workspace"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if agentPath != "/path/to/workspace" {
+		t.Errorf("agentPath = %q, want %q", agentPath, "/path/to/workspace")
+	}
+	if configPath != defaultConfigPath {
+		t.Errorf("configPath = %q, want %q (default)", configPath, defaultConfigPath)
+	}
+	if vaultPath != defaultVaultPath {
+		t.Errorf("vaultPath = %q, want %q (default)", vaultPath, defaultVaultPath)
+	}
+}
+
+func TestParseAgentFlags_WithAllFlags(t *testing.T) {
+	agentPath, configPath, vaultPath, err := parseAgentFlags([]string{
+		"--agent", "/ws", "--config", "/cfg.json", "--vault", "/v.enc",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if agentPath != "/ws" {
+		t.Errorf("agentPath = %q, want %q", agentPath, "/ws")
+	}
+	if configPath != "/cfg.json" {
+		t.Errorf("configPath = %q, want %q", configPath, "/cfg.json")
+	}
+	if vaultPath != "/v.enc" {
+		t.Errorf("vaultPath = %q, want %q", vaultPath, "/v.enc")
+	}
+}
+
+func TestParseAgentFlags_NoFlags(t *testing.T) {
+	agentPath, _, _, err := parseAgentFlags(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if agentPath != "" {
+		t.Errorf("agentPath = %q, want empty", agentPath)
+	}
+}
+
+func TestParseAgentFlags_AgentMissingPath(t *testing.T) {
+	_, _, _, err := parseAgentFlags([]string{"--agent"})
+	if err == nil {
+		t.Fatal("expected error for --agent without path")
+	}
+	if !strings.Contains(err.Error(), "--agent requires") {
+		t.Errorf("error = %q, want to contain '--agent requires'", err)
+	}
+}
+
+func TestParseAgentFlags_ConfigMissingPath(t *testing.T) {
+	_, _, _, err := parseAgentFlags([]string{"--agent", "/ws", "--config"})
+	if err == nil {
+		t.Fatal("expected error for --config without path")
+	}
+	if !strings.Contains(err.Error(), "--config requires") {
+		t.Errorf("error = %q, want to contain '--config requires'", err)
+	}
+}
+
+func TestParseAgentFlags_VaultMissingPath(t *testing.T) {
+	_, _, _, err := parseAgentFlags([]string{"--agent", "/ws", "--vault"})
+	if err == nil {
+		t.Fatal("expected error for --vault without path")
+	}
+	if !strings.Contains(err.Error(), "--vault requires") {
+		t.Errorf("error = %q, want to contain '--vault requires'", err)
+	}
+}
+
+func TestRun_RunWithAgentFlag(t *testing.T) {
+	// "run --agent /nonexistent" should fail because workspace doesn't exist.
+	var stderr bytes.Buffer
+	code := run([]string{"pureclaw", "run", "--agent", "/nonexistent/workspace"}, strings.NewReader(""), io.Discard, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+}
+
+func TestRun_RunAgentFlagMissingWorkspace(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"pureclaw", "run", "--agent"}, strings.NewReader(""), io.Discard, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "--agent requires") {
+		t.Errorf("expected '--agent requires' error, got %q", stderr.String())
+	}
+}
+
 // TestMain_subprocess tests the main() function which calls os.Exit.
 // Uses the subprocess pattern: re-exec the test binary with a flag.
 func TestMain_subprocess(t *testing.T) {

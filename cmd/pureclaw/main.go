@@ -25,6 +25,15 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	case "init":
 		return runInit(stdin, stdout, stderr)
 	case "run":
+		// Check for --agent flag: pureclaw run --agent <workspace-path> [--config <path>] [--vault <path>]
+		agentPath, configPath, vaultPath, err := parseAgentFlags(args[2:])
+		if err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return 1
+		}
+		if agentPath != "" {
+			return runSubAgentCmd(agentPath, configPath, vaultPath, stdin, stderr)
+		}
 		return runAgent(stdin, stdout, stderr)
 	case "vault":
 		if len(args) < 3 {
@@ -36,6 +45,43 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		printUsage(stderr)
 		return 1
 	}
+}
+
+// parseAgentFlags parses --agent, --config, --vault from args after "run".
+// Returns empty agentPath if --agent is not present.
+func parseAgentFlags(args []string) (agentPath, configPath, vaultPath string, err error) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			if i+1 >= len(args) {
+				return "", "", "", fmt.Errorf("--agent requires a workspace path argument")
+			}
+			agentPath = args[i+1]
+			i++
+		case "--config":
+			if i+1 >= len(args) {
+				return "", "", "", fmt.Errorf("--config requires a path argument")
+			}
+			configPath = args[i+1]
+			i++
+		case "--vault":
+			if i+1 >= len(args) {
+				return "", "", "", fmt.Errorf("--vault requires a path argument")
+			}
+			vaultPath = args[i+1]
+			i++
+		}
+	}
+	// Default paths if --agent is present but paths not specified.
+	if agentPath != "" {
+		if configPath == "" {
+			configPath = defaultConfigPath
+		}
+		if vaultPath == "" {
+			vaultPath = defaultVaultPath
+		}
+	}
+	return agentPath, configPath, vaultPath, nil
 }
 
 func printUsage(w io.Writer) {
