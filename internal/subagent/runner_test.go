@@ -567,3 +567,224 @@ func TestLaunchSubAgent_ReadFileError(t *testing.T) {
 		t.Fatal("timed out waiting for SubAgentResult")
 	}
 }
+
+func TestRunner_IsActive_NoSubAgent(t *testing.T) {
+	r := NewRunner()
+	if r.IsActive() {
+		t.Error("IsActive() = true, want false for fresh runner")
+	}
+}
+
+func TestRunner_IsActive_WithSubAgent(t *testing.T) {
+	saveRunnerVars(t)
+
+	wsDir := t.TempDir()
+
+	// Process sleeps long enough for us to check IsActive.
+	execCommand = fakeCmd(0, 2000)
+
+	r := NewRunner()
+	resultCh := make(chan SubAgentResult, 1)
+
+	err := r.LaunchSubAgent(context.Background(), RunnerConfig{
+		BinaryPath:    os.Args[0],
+		WorkspacePath: wsDir,
+		TaskID:        "active-task",
+		Timeout:       5 * time.Second,
+		ConfigPath:    "/tmp/config.json",
+		VaultPath:     "/tmp/vault.enc",
+	}, resultCh)
+	if err != nil {
+		t.Fatalf("LaunchSubAgent() error = %v", err)
+	}
+
+	if !r.IsActive() {
+		t.Error("IsActive() = false, want true while sub-agent running")
+	}
+
+	// Wait for completion.
+	select {
+	case <-resultCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for SubAgentResult")
+	}
+}
+
+func TestRunner_IsActive_AfterCompletion(t *testing.T) {
+	saveRunnerVars(t)
+
+	wsDir := t.TempDir()
+
+	execCommand = fakeCmd(0, 10)
+	osReadFile = func(path string) ([]byte, error) {
+		return nil, os.ErrNotExist
+	}
+
+	r := NewRunner()
+	resultCh := make(chan SubAgentResult, 1)
+
+	err := r.LaunchSubAgent(context.Background(), RunnerConfig{
+		BinaryPath:    os.Args[0],
+		WorkspacePath: wsDir,
+		TaskID:        "complete-task",
+		Timeout:       5 * time.Second,
+		ConfigPath:    "/tmp/config.json",
+		VaultPath:     "/tmp/vault.enc",
+	}, resultCh)
+	if err != nil {
+		t.Fatalf("LaunchSubAgent() error = %v", err)
+	}
+
+	// Wait for completion.
+	select {
+	case <-resultCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for SubAgentResult")
+	}
+
+	if r.IsActive() {
+		t.Error("IsActive() = true, want false after sub-agent completed")
+	}
+}
+
+func TestRunner_WaitForCompletion_NoActive(t *testing.T) {
+	r := NewRunner()
+
+	ctx := context.Background()
+	err := r.WaitForCompletion(ctx)
+	if err != nil {
+		t.Errorf("WaitForCompletion() error = %v, want nil", err)
+	}
+}
+
+func TestRunner_WaitForCompletion_WaitsForSubAgent(t *testing.T) {
+	saveRunnerVars(t)
+
+	wsDir := t.TempDir()
+
+	// Process sleeps 500ms.
+	execCommand = fakeCmd(0, 500)
+	osReadFile = func(path string) ([]byte, error) {
+		return nil, os.ErrNotExist
+	}
+
+	r := NewRunner()
+	resultCh := make(chan SubAgentResult, 1)
+
+	err := r.LaunchSubAgent(context.Background(), RunnerConfig{
+		BinaryPath:    os.Args[0],
+		WorkspacePath: wsDir,
+		TaskID:        "wait-task",
+		Timeout:       5 * time.Second,
+		ConfigPath:    "/tmp/config.json",
+		VaultPath:     "/tmp/vault.enc",
+	}, resultCh)
+	if err != nil {
+		t.Fatalf("LaunchSubAgent() error = %v", err)
+	}
+
+	// WaitForCompletion should block until the sub-agent finishes.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	waitErr := r.WaitForCompletion(ctx)
+	if waitErr != nil {
+		t.Errorf("WaitForCompletion() error = %v, want nil", waitErr)
+	}
+
+	// After WaitForCompletion, runner should not be active.
+	if r.IsActive() {
+		t.Error("IsActive() = true after WaitForCompletion returned")
+	}
+
+	// Drain result channel.
+	select {
+	case <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SubAgentResult")
+	}
+}
+
+func TestRunner_WaitForCompletion_ContextExpired(t *testing.T) {
+	saveRunnerVars(t)
+
+	wsDir := t.TempDir()
+
+	// Process sleeps long.
+	execCommand = fakeCmd(0, 5000)
+
+	r := NewRunner()
+	resultCh := make(chan SubAgentResult, 1)
+
+	err := r.LaunchSubAgent(context.Background(), RunnerConfig{
+		BinaryPath:    os.Args[0],
+		WorkspacePath: wsDir,
+		TaskID:        "ctx-expire-task",
+		Timeout:       10 * time.Second,
+		ConfigPath:    "/tmp/config.json",
+		VaultPath:     "/tmp/vault.enc",
+	}, resultCh)
+	if err != nil {
+		t.Fatalf("LaunchSubAgent() error = %v", err)
+	}
+
+	// Use a very short timeout so WaitForCompletion returns ctx error.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	waitErr := r.WaitForCompletion(ctx)
+	if waitErr == nil {
+		t.Fatal("WaitForCompletion() error = nil, want context error")
+	}
+	if !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Errorf("WaitForCompletion() error = %v, want context.DeadlineExceeded", waitErr)
+	}
+
+	// Drain result channel to avoid goroutine leak.
+	select {
+	case <-resultCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for SubAgentResult")
+	}
+}
+
+func TestRunner_SIGTERM_SentToSubAgent(t *testing.T) {
+	saveRunnerVars(t)
+
+	wsDir := t.TempDir()
+
+	// Process sleeps long, context will be cancelled triggering cmd.Cancel.
+	execCommand = fakeCmd(0, 5000)
+
+	r := NewRunner()
+	resultCh := make(chan SubAgentResult, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	err := r.LaunchSubAgent(ctx, RunnerConfig{
+		BinaryPath:    os.Args[0],
+		WorkspacePath: wsDir,
+		TaskID:        "sigterm-task",
+		Timeout:       10 * time.Second,
+		ConfigPath:    "/tmp/config.json",
+		VaultPath:     "/tmp/vault.enc",
+	}, resultCh)
+	if err != nil {
+		t.Fatalf("LaunchSubAgent() error = %v", err)
+	}
+
+	// Cancel context to trigger cmd.Cancel (which now sends SIGTERM).
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		// The subprocess should be terminated via SIGTERM (or SIGKILL after WaitDelay).
+		// Either way it should complete — the key test is that it doesn't hang.
+		if result.Err == nil {
+			t.Error("Err = nil, want error (process killed)")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for SubAgentResult — SIGTERM may not have been sent")
+	}
+}

@@ -37,12 +37,41 @@ type RunnerConfig struct {
 type Runner struct {
 	mu     sync.Mutex
 	active bool
+	done   chan struct{} // closed when watchSubAgent completes
 }
 
 // NewRunner creates a new sub-agent runner.
 func NewRunner() *Runner {
 	slog.Info("runner created", "component", "subagent", "operation", "new_runner")
-	return &Runner{}
+	return &Runner{
+		done: make(chan struct{}),
+	}
+}
+
+// IsActive returns whether a sub-agent is currently running.
+func (r *Runner) IsActive() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active
+}
+
+// WaitForCompletion blocks until the active sub-agent completes or ctx expires.
+// Returns nil immediately if no sub-agent is active.
+func (r *Runner) WaitForCompletion(ctx context.Context) error {
+	r.mu.Lock()
+	if !r.active {
+		r.mu.Unlock()
+		return nil
+	}
+	done := r.done
+	r.mu.Unlock()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // LaunchSubAgent spawns a sub-agent as a subprocess with timeout enforcement.
@@ -56,6 +85,7 @@ func (r *Runner) LaunchSubAgent(ctx context.Context, cfg RunnerConfig, resultCh 
 		return fmt.Errorf("sub-agent already active")
 	}
 	r.active = true
+	r.done = make(chan struct{})
 	r.mu.Unlock()
 
 	// Validate workspace exists.
@@ -88,8 +118,9 @@ func (r *Runner) LaunchSubAgent(ctx context.Context, cfg RunnerConfig, resultCh 
 	// Process group for clean kill.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		// Kill entire process group.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Send SIGTERM to process group for graceful shutdown.
+		// Go's exec.Cmd sends SIGKILL automatically after WaitDelay if needed.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 	cmd.WaitDelay = 5 * time.Second
 
@@ -155,11 +186,14 @@ func (r *Runner) watchSubAgent(timeoutCtx context.Context, cancel context.Cancel
 			"task_id", cfg.TaskID, "error", readErr)
 	}
 
-	// Release active flag BEFORE sending result so callers can immediately
-	// launch another sub-agent after receiving the result.
+	// Release active flag and signal completion BEFORE sending result so callers
+	// can immediately launch another sub-agent after receiving the result, and
+	// WaitForCompletion unblocks before the result is processed by the event loop.
 	r.mu.Lock()
 	r.active = false
+	done := r.done
 	r.mu.Unlock()
+	close(done)
 
 	// Send result to event loop. The channel must be buffered (capacity >= 1).
 	resultCh <- result

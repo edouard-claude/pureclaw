@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,7 +47,7 @@ var (
 		return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	}
 	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
-		go p.Run(ctx, ch)
+		p.Run(ctx, ch)
 	}
 	osExecutable = os.Executable
 )
@@ -237,12 +238,21 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signalContext()
 	defer stop()
 
-	// 9. Start watcher goroutine
-	go w.Run(ctx, fileChanges)
+	// 9. Start watcher goroutine with WaitGroup tracking
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.Run(ctx, fileChanges)
+	}()
 
-	// 10. Start poller goroutine
+	// 10. Start poller goroutine with WaitGroup tracking
 	messages := make(chan telegram.TelegramMessage, 1)
-	runPollerFn(ctx, poller, messages)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runPollerFn(ctx, poller, messages)
+	}()
 
 	// 11. Run event loop (blocks until ctx cancelled)
 	slog.Info("agent started",
@@ -261,7 +271,47 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	slog.Info("agent stopped", "component", "cmd", "operation", "run")
+	// === SHUTDOWN SEQUENCE ===
+	shutdownStart := time.Now()
+	slog.Info("shutdown initiated", "component", "pureclaw", "operation", "shutdown")
+
+	// Create shutdown deadline context (30 seconds per NFR18).
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// 1. Write final memory entry.
+	if err := mem.Write(shutdownCtx, "agent", "Shutdown initiated (signal received)"); err != nil {
+		slog.Warn("failed to write shutdown memory entry",
+			"component", "pureclaw", "operation", "shutdown", "error", err)
+	}
+
+	// 2. Wait for active sub-agent to complete.
+	if runner.IsActive() {
+		slog.Info("waiting for active sub-agent",
+			"component", "pureclaw", "operation", "shutdown")
+		if err := runner.WaitForCompletion(shutdownCtx); err != nil {
+			slog.Warn("sub-agent wait timed out during shutdown",
+				"component", "pureclaw", "operation", "shutdown", "error", err)
+		}
+	}
+
+	// 3. Wait for background goroutines (poller + watcher) to exit.
+	goroutineDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(goroutineDone)
+	}()
+
+	select {
+	case <-goroutineDone:
+		slog.Info("all goroutines stopped", "component", "pureclaw", "operation", "shutdown")
+	case <-shutdownCtx.Done():
+		slog.Warn("goroutine shutdown timed out", "component", "pureclaw", "operation", "shutdown")
+	}
+
+	slog.Info("shutdown complete",
+		"component", "pureclaw", "operation", "shutdown",
+		"duration", time.Since(shutdownStart))
 	fmt.Fprintln(stderr, "Agent stopped.")
 	return 0
 }

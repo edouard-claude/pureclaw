@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ func saveRunVars(t *testing.T) {
 	origVaultOpenFn := vaultOpenFn
 	origWorkspaceLoad := workspaceLoad
 	origNewLLMClient := newLLMClient
+	origNewAudioClient := newAudioClient
 	origNewTGClient := newTGClient
 	origNewPoller := newPoller
 	origNewSender := newSender
@@ -34,6 +36,7 @@ func saveRunVars(t *testing.T) {
 	origNewAgent := newAgent
 	origSignalContext := signalContext
 	origRunPollerFn := runPollerFn
+	origOsExecutable := osExecutable
 	t.Cleanup(func() {
 		configLoad = origConfigLoad
 		vaultLoadSalt = origVaultLoadSalt
@@ -41,6 +44,7 @@ func saveRunVars(t *testing.T) {
 		vaultOpenFn = origVaultOpenFn
 		workspaceLoad = origWorkspaceLoad
 		newLLMClient = origNewLLMClient
+		newAudioClient = origNewAudioClient
 		newTGClient = origNewTGClient
 		newPoller = origNewPoller
 		newSender = origNewSender
@@ -48,6 +52,7 @@ func saveRunVars(t *testing.T) {
 		newAgent = origNewAgent
 		signalContext = origSignalContext
 		runPollerFn = origRunPollerFn
+		osExecutable = origOsExecutable
 	})
 }
 
@@ -103,6 +108,7 @@ func setupHappyPath(t *testing.T, dir string) {
 
 	// Replace clients with stubs that don't make network calls.
 	newLLMClient = func(apiKey, model string) agent.LLMClient { return &stubLLM{} }
+	newAudioClient = func(apiKey, model string) agent.Transcriber { return llm.NewClient(apiKey, model) }
 	newSender = func(client *telegram.Client) agent.Sender { return &stubSender{} }
 	newMemory = func(root string) *memory.Memory { return memory.New(root) }
 }
@@ -271,9 +277,9 @@ func TestRunAgent_FullStartup(t *testing.T) {
 		return context.WithTimeout(context.Background(), 100*time.Millisecond)
 	}
 
-	// Replace poller goroutine with a no-op — avoid real HTTP calls.
+	// Replace poller with a blocking mock that respects ctx.Done().
 	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
-		// Don't start real poller — context will cancel and agent will exit.
+		<-ctx.Done()
 	}
 
 	var stderr bytes.Buffer
@@ -288,5 +294,150 @@ func TestRunAgent_FullStartup(t *testing.T) {
 	}
 	if !strings.Contains(output, "Agent stopped") {
 		t.Errorf("expected 'Agent stopped' in output, got %q", output)
+	}
+}
+
+func TestRunAgent_GracefulShutdown(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+	setupHappyPath(t, dir)
+
+	// Use a cancellable context to simulate SIGTERM.
+	ctx, cancel := context.WithCancel(context.Background())
+	signalContext = func() (context.Context, context.CancelFunc) {
+		return ctx, cancel
+	}
+
+	// Poller blocks on ctx.Done() like the real poller.
+	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
+		<-ctx.Done()
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		var stderr bytes.Buffer
+		done <- runAgent(strings.NewReader("test-pass\n"), io.Discard, &stderr)
+	}()
+
+	// Give agent time to start, then send "SIGTERM".
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("expected exit code 0, got %d", code)
+		}
+	case <-time.After(35 * time.Second):
+		t.Fatal("runAgent did not complete within 35 seconds — shutdown may be hanging")
+	}
+}
+
+func TestRunAgent_ShutdownWritesMemory(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+	setupHappyPath(t, dir)
+
+	signalContext = func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 100*time.Millisecond)
+	}
+
+	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
+		<-ctx.Done()
+	}
+
+	var stderr bytes.Buffer
+	code := runAgent(strings.NewReader("test-pass\n"), io.Discard, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, stderr.String())
+	}
+
+	// Verify shutdown memory entry was written.
+	wsDir := dir + "/workspace"
+	memDir := filepath.Join(wsDir, "memory")
+
+	var found bool
+	filepath.WalkDir(memDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		if strings.Contains(string(data), "Shutdown initiated (signal received)") {
+			found = true
+		}
+		return nil
+	})
+
+	if !found {
+		t.Error("expected shutdown memory entry 'Shutdown initiated (signal received)' not found in memory files")
+	}
+}
+
+func TestRunAgent_ShutdownNoSubAgent(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+	setupHappyPath(t, dir)
+
+	signalContext = func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 100*time.Millisecond)
+	}
+
+	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
+		<-ctx.Done()
+	}
+
+	start := time.Now()
+	var stderr bytes.Buffer
+	code := runAgent(strings.NewReader("test-pass\n"), io.Discard, &stderr)
+	elapsed := time.Since(start)
+
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, stderr.String())
+	}
+
+	// Without an active sub-agent, shutdown should be fast (well under 30s).
+	if elapsed > 10*time.Second {
+		t.Errorf("shutdown took %v — expected fast exit without active sub-agent", elapsed)
+	}
+}
+
+func TestRunAgent_ShutdownGracefulCancel(t *testing.T) {
+	// Tests the graceful shutdown path when context is cancelled (simulates SIGTERM).
+	// No sub-agent is active — the runner.IsActive() == false path is exercised.
+	// The active sub-agent shutdown path (runner.WaitForCompletion) is covered by
+	// unit tests in internal/subagent/runner_test.go (TestRunner_WaitForCompletion_*).
+	dir := t.TempDir()
+	chdir(t, dir)
+	setupHappyPath(t, dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	signalContext = func() (context.Context, context.CancelFunc) {
+		return ctx, cancel
+	}
+
+	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
+		<-ctx.Done()
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		var stderr bytes.Buffer
+		done <- runAgent(strings.NewReader("test-pass\n"), io.Discard, &stderr)
+	}()
+
+	// Give agent time to start, then cancel to trigger shutdown.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("expected exit code 0, got %d", code)
+		}
+	case <-time.After(35 * time.Second):
+		t.Fatal("runAgent did not complete within 35 seconds")
 	}
 }
