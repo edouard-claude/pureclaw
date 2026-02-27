@@ -132,11 +132,31 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	// 6a. Create memory (serves both writer and searcher)
 	mem := newMemory(cfg.Workspace)
 
-	// 6b. Create tool registry
+	// 6b. Extract vault secret values for exec_command sanitization (NFR9)
+	keys := v.List()
+	secrets := make([]string, 0, len(keys))
+	for _, k := range keys {
+		val, err := v.Get(k)
+		if err != nil {
+			slog.Warn("failed to read vault secret for sanitization",
+				"component", "cmd",
+				"operation", "run",
+				"key", k,
+				"error", err,
+			)
+			continue
+		}
+		if val != "" {
+			secrets = append(secrets, val)
+		}
+	}
+
+	// 6c. Create tool registry
 	registry := tool.NewRegistry()
 	registry.Register(tool.NewReadFile())
 	registry.Register(tool.NewWriteFile())
 	registry.Register(tool.NewListDir())
+	registry.Register(tool.NewExecCommand(secrets))
 
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
