@@ -23,8 +23,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		fmt.Fprintln(stdout, Version)
 		return 0
 	case "init":
-		fmt.Fprintln(stderr, "init: not yet implemented")
-		return 1
+		return runInit(stdin, stdout, stderr)
 	case "run":
 		fmt.Fprintln(stderr, "run: not yet implemented")
 		return 1

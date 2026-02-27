@@ -5,6 +5,7 @@
 
 # Test coverage
 coverage.out
+cover.out
 
 # Environment
 .env

@@ -37,7 +37,7 @@ func TestRun_unknownCommand(t *testing.T) {
 }
 
 func TestRun_unimplementedCommands(t *testing.T) {
-	cmds := []string{"init", "run"}
+	cmds := []string{"run"}
 	for _, cmd := range cmds {
 		t.Run(cmd, func(t *testing.T) {
 			code := run([]string{"pureclaw", cmd}, strings.NewReader(""), io.Discard, io.Discard)
@@ -45,6 +45,21 @@ func TestRun_unimplementedCommands(t *testing.T) {
 				t.Fatalf("expected exit code 1 for unimplemented %q, got %d", cmd, code)
 			}
 		})
+	}
+}
+
+func TestRun_initDelegation(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	input := "sk-key\nbot-token\n123\npassphrase\n30m\n"
+	var stderr bytes.Buffer
+	code := run([]string{"pureclaw", "init"}, strings.NewReader(input), io.Discard, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "pureclaw is ready!") {
+		t.Fatalf("expected success message, got %q", stderr.String())
 	}
 }
 
