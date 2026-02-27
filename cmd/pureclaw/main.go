@@ -1,0 +1,48 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+)
+
+// Version is set at build time via -ldflags "-X main.Version=x.y.z".
+var Version = "dev"
+
+func main() {
+	os.Exit(run(os.Args, os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout io.Writer, stderr io.Writer) int {
+	if len(args) < 2 {
+		printUsage(stderr)
+		return 1
+	}
+	switch args[1] {
+	case "version":
+		fmt.Fprintln(stdout, Version)
+		return 0
+	case "init":
+		fmt.Fprintln(stderr, "init: not yet implemented")
+		return 1
+	case "run":
+		fmt.Fprintln(stderr, "run: not yet implemented")
+		return 1
+	case "vault":
+		fmt.Fprintln(stderr, "vault: not yet implemented")
+		return 1
+	default:
+		printUsage(stderr)
+		return 1
+	}
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: pureclaw <command>")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Commands:")
+	fmt.Fprintln(w, "  init      Initialize a new workspace")
+	fmt.Fprintln(w, "  run       Start the agent")
+	fmt.Fprintln(w, "  vault     Manage encrypted vault")
+	fmt.Fprintln(w, "  version   Print version")
+}

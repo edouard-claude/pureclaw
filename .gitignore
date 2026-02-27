@@ -1,0 +1,10 @@
+# Binaries
+/pureclaw
+/pureclaw-arm64
+*.exe
+
+# Test coverage
+coverage.out
+
+# Environment
+.env
