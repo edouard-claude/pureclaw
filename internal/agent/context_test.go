@@ -98,6 +98,81 @@ func TestBuildMessages_WithHistory(t *testing.T) {
 	}
 }
 
+func TestSystemPrompt_WorkspacePaths(t *testing.T) {
+	ws := &workspace.Workspace{
+		Root:    "/home/user/workspace",
+		SoulMD:  "Soul",
+		AgentMD: "Agent",
+	}
+	ag := New(NewAgentConfig{Workspace: ws})
+
+	prompt := ag.systemPrompt()
+
+	if !strings.Contains(prompt, "## Workspace Files") {
+		t.Error("expected system prompt to contain workspace files header")
+	}
+	if !strings.Contains(prompt, "Root: /home/user/workspace") {
+		t.Error("expected system prompt to contain workspace root path")
+	}
+	if !strings.Contains(prompt, "/home/user/workspace/AGENT.md") {
+		t.Error("expected system prompt to contain AGENT.md path")
+	}
+	if !strings.Contains(prompt, "/home/user/workspace/SOUL.md") {
+		t.Error("expected system prompt to contain SOUL.md path")
+	}
+	if !strings.Contains(prompt, "/home/user/workspace/HEARTBEAT.md") {
+		t.Error("expected system prompt to contain HEARTBEAT.md path")
+	}
+	if !strings.Contains(prompt, "/home/user/workspace/skills/") {
+		t.Error("expected system prompt to contain skills directory path")
+	}
+}
+
+func TestSystemPrompt_SelfReconfigurationInfo(t *testing.T) {
+	ws := &workspace.Workspace{
+		Root:    "/workspace",
+		SoulMD:  "Soul",
+		AgentMD: "Agent",
+	}
+	ag := New(NewAgentConfig{Workspace: ws})
+
+	prompt := ag.systemPrompt()
+
+	if !strings.Contains(prompt, "read_file") {
+		t.Error("expected system prompt to mention read_file")
+	}
+	if !strings.Contains(prompt, "write_file") {
+		t.Error("expected system prompt to mention write_file")
+	}
+	if !strings.Contains(prompt, "reload_workspace") {
+		t.Error("expected system prompt to mention reload_workspace")
+	}
+}
+
+func TestSystemPrompt_SectionOrder(t *testing.T) {
+	ws := &workspace.Workspace{
+		Root:    "/workspace",
+		SoulMD:  "Soul content",
+		AgentMD: "Agent content",
+	}
+	ag := New(NewAgentConfig{Workspace: ws})
+
+	prompt := ag.systemPrompt()
+
+	wsIdx := strings.Index(prompt, "## Workspace Files")
+	fmtIdx := strings.Index(prompt, "## Response Format")
+
+	if wsIdx == -1 {
+		t.Fatal("workspace files section not found")
+	}
+	if fmtIdx == -1 {
+		t.Fatal("response format section not found")
+	}
+	if wsIdx >= fmtIdx {
+		t.Error("expected workspace files section to appear before response format section")
+	}
+}
+
 func TestAddToHistory_Basic(t *testing.T) {
 	ws := &workspace.Workspace{Root: t.TempDir(), SoulMD: "S", AgentMD: "A"}
 	ag := New(NewAgentConfig{Workspace: ws})

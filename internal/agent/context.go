@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/edouard/pureclaw/internal/llm"
@@ -13,6 +14,15 @@ func (a *Agent) systemPrompt() string {
 	var b strings.Builder
 	b.WriteString(a.workspace.SystemPrompt())
 	b.WriteString("\n\n")
+	b.WriteString("## Workspace Files\n\n")
+	b.WriteString(fmt.Sprintf("Root: %s\n", a.workspace.Root))
+	b.WriteString(fmt.Sprintf("- AGENT.md: %s/AGENT.md\n", a.workspace.Root))
+	b.WriteString(fmt.Sprintf("- SOUL.md: %s/SOUL.md\n", a.workspace.Root))
+	b.WriteString(fmt.Sprintf("- HEARTBEAT.md: %s/HEARTBEAT.md\n", a.workspace.Root))
+	b.WriteString(fmt.Sprintf("- Skills directory: %s/skills/\n", a.workspace.Root))
+	b.WriteString("\nYou can use read_file and write_file to read and modify these files. ")
+	b.WriteString("After modifying any workspace file, call reload_workspace to apply changes immediately.\n")
+	b.WriteString("\n")
 	b.WriteString("## Response Format\n\n")
 	b.WriteString("You MUST respond with valid JSON in exactly one of these formats:\n\n")
 	b.WriteString(`{"type": "message", "content": "text for user"}` + "\n")

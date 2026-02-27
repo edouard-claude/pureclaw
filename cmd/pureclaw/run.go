@@ -157,6 +157,7 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	registry.Register(tool.NewWriteFile())
 	registry.Register(tool.NewListDir())
 	registry.Register(tool.NewExecCommand(secrets))
+	registry.Register(tool.NewReloadWorkspace(ws))
 
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
