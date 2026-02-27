@@ -45,6 +45,11 @@ type ToolExecutor interface {
 	Definitions() []llm.Tool
 }
 
+// HeartbeatExecutor abstracts the heartbeat execution for testability.
+type HeartbeatExecutor interface {
+	Execute(ctx context.Context, heartbeatContent string) error
+}
+
 // NewAgentConfig holds all dependencies for Agent construction.
 type NewAgentConfig struct {
 	Workspace      *workspace.Workspace
@@ -54,6 +59,8 @@ type NewAgentConfig struct {
 	MemorySearcher MemorySearcher
 	ToolExecutor   ToolExecutor
 	FileChanges    <-chan struct{}
+	HeartbeatTick  <-chan time.Time
+	Heartbeat      HeartbeatExecutor
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
@@ -65,6 +72,8 @@ type Agent struct {
 	memorySearcher MemorySearcher
 	toolExecutor   ToolExecutor
 	fileChanges    <-chan struct{}
+	heartbeatTick  <-chan time.Time
+	heartbeat      HeartbeatExecutor
 	history        []llm.Message
 }
 
@@ -78,6 +87,8 @@ func New(cfg NewAgentConfig) *Agent {
 		memorySearcher: cfg.MemorySearcher,
 		toolExecutor:   cfg.ToolExecutor,
 		fileChanges:    cfg.FileChanges,
+		heartbeatTick:  cfg.HeartbeatTick,
+		heartbeat:      cfg.Heartbeat,
 	}
 }
 
@@ -102,6 +113,8 @@ func (a *Agent) Run(ctx context.Context, messages <-chan telegram.TelegramMessag
 			a.handleMessage(ctx, msg)
 		case <-a.fileChanges:
 			a.handleFileChange(ctx)
+		case <-a.heartbeatTick:
+			a.handleHeartbeat(ctx)
 		}
 	}
 }
@@ -275,6 +288,39 @@ func (a *Agent) handleFileChange(ctx context.Context) {
 		"operation", "file_change",
 		"skills", len(a.workspace.Skills),
 	)
+}
+
+// handleHeartbeat runs one heartbeat cycle using the configured executor.
+func (a *Agent) handleHeartbeat(ctx context.Context) {
+	if a.heartbeat == nil {
+		slog.Warn("heartbeat tick received but no executor configured",
+			"component", "agent",
+			"operation", "heartbeat",
+		)
+		return
+	}
+
+	heartbeatContent := a.workspace.HeartbeatMD
+	if heartbeatContent == "" {
+		slog.Warn("heartbeat tick received but HEARTBEAT.md is empty",
+			"component", "agent",
+			"operation", "heartbeat",
+		)
+		return
+	}
+
+	slog.Info("heartbeat cycle starting",
+		"component", "agent",
+		"operation", "heartbeat",
+	)
+
+	if err := a.heartbeat.Execute(ctx, heartbeatContent); err != nil {
+		slog.Error("heartbeat execution failed",
+			"component", "agent",
+			"operation", "heartbeat",
+			"error", err,
+		)
+	}
 }
 
 func (a *Agent) logMemory(ctx context.Context, source, content string) {

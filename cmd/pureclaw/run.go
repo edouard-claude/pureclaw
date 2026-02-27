@@ -13,6 +13,7 @@ import (
 
 	"github.com/edouard/pureclaw/internal/agent"
 	"github.com/edouard/pureclaw/internal/config"
+	"github.com/edouard/pureclaw/internal/heartbeat"
 	"github.com/edouard/pureclaw/internal/llm"
 	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
@@ -165,6 +166,21 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	registry.Register(tool.NewExecCommand(secrets))
 	registry.Register(tool.NewReloadWorkspace(ws))
 
+	// 6e. Create heartbeat executor and ticker
+	var heartbeatTick <-chan time.Time
+	var hb agent.HeartbeatExecutor
+	if cfg.HeartbeatInterval.Duration > 0 {
+		hb = heartbeat.NewExecutor(llmClient, sender, mem, cfg.TelegramAllowedIDs)
+		heartbeatTicker := time.NewTicker(cfg.HeartbeatInterval.Duration)
+		defer heartbeatTicker.Stop()
+		heartbeatTick = heartbeatTicker.C
+		slog.Info("heartbeat enabled",
+			"component", "cmd",
+			"operation", "run",
+			"interval", cfg.HeartbeatInterval.Duration,
+		)
+	}
+
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
 		Workspace:      ws,
@@ -174,6 +190,8 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		MemorySearcher: mem,
 		ToolExecutor:   registry,
 		FileChanges:    fileChanges,
+		HeartbeatTick:  heartbeatTick,
+		Heartbeat:      hb,
 	})
 
 	// 8. Signal handling

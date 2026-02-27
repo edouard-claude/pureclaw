@@ -1233,6 +1233,158 @@ func TestRun_FileChangeEvent(t *testing.T) {
 	}
 }
 
+// --- Heartbeat tests ---
+
+type fakeHeartbeatExecutor struct {
+	called  bool
+	content string
+	err     error
+}
+
+func (f *fakeHeartbeatExecutor) Execute(ctx context.Context, heartbeatContent string) error {
+	f.called = true
+	f.content = heartbeatContent
+	return f.err
+}
+
+func TestHandleHeartbeat_Success(t *testing.T) {
+	ws := testWorkspace(t)
+	ws.HeartbeatMD = "- [ ] Check server health"
+	hb := &fakeHeartbeatExecutor{}
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       &fakeLLM{},
+		Sender:    &fakeSender{},
+		Heartbeat: hb,
+	})
+
+	ag.handleHeartbeat(context.Background())
+
+	if !hb.called {
+		t.Error("expected heartbeat executor to be called")
+	}
+	if hb.content != "- [ ] Check server health" {
+		t.Errorf("expected content %q, got %q", "- [ ] Check server health", hb.content)
+	}
+}
+
+func TestHandleHeartbeat_EmptyHeartbeatMD(t *testing.T) {
+	ws := testWorkspace(t)
+	ws.HeartbeatMD = ""
+	hb := &fakeHeartbeatExecutor{}
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       &fakeLLM{},
+		Sender:    &fakeSender{},
+		Heartbeat: hb,
+	})
+
+	ag.handleHeartbeat(context.Background())
+
+	if hb.called {
+		t.Error("expected heartbeat executor NOT to be called with empty HeartbeatMD")
+	}
+}
+
+func TestHandleHeartbeat_NilExecutor(t *testing.T) {
+	ws := testWorkspace(t)
+	ws.HeartbeatMD = "- [ ] Check something"
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       &fakeLLM{},
+		Sender:    &fakeSender{},
+		Heartbeat: nil,
+	})
+
+	// Should not panic.
+	ag.handleHeartbeat(context.Background())
+}
+
+func TestHandleHeartbeat_ExecutorError(t *testing.T) {
+	ws := testWorkspace(t)
+	ws.HeartbeatMD = "- [ ] Check stuff"
+	hb := &fakeHeartbeatExecutor{err: errors.New("heartbeat failed")}
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       &fakeLLM{},
+		Sender:    &fakeSender{},
+		Heartbeat: hb,
+	})
+
+	// Should not panic; error is logged.
+	ag.handleHeartbeat(context.Background())
+
+	if !hb.called {
+		t.Error("expected heartbeat executor to be called")
+	}
+}
+
+func TestRun_HeartbeatTickEvent(t *testing.T) {
+	ws := testWorkspace(t)
+	ws.HeartbeatMD = "- [ ] Check disk"
+	hb := &fakeHeartbeatExecutor{}
+	heartbeatTick := make(chan time.Time, 1)
+
+	ag := New(NewAgentConfig{
+		Workspace:     ws,
+		LLM:           &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "ok")}},
+		Sender:        &fakeSender{},
+		Heartbeat:     hb,
+		HeartbeatTick: heartbeatTick,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	// Send a heartbeat tick.
+	heartbeatTick <- time.Now()
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	<-done
+
+	if !hb.called {
+		t.Error("expected heartbeat executor to be called on tick event")
+	}
+	if hb.content != "- [ ] Check disk" {
+		t.Errorf("expected content %q, got %q", "- [ ] Check disk", hb.content)
+	}
+}
+
+func TestRun_NilHeartbeatTick(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	// HeartbeatTick is nil — should work fine (backward compatible).
+	ag := New(NewAgentConfig{
+		Workspace:     ws,
+		LLM:           llmFake,
+		Sender:        sender,
+		HeartbeatTick: nil,
+		Heartbeat:     nil,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message with nil HeartbeatTick, got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "hello" {
+		t.Errorf("expected text %q, got %q", "hello", sender.sent[0].text)
+	}
+}
+
 func TestRun_NilFileChanges(t *testing.T) {
 	ws := testWorkspace(t)
 	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
