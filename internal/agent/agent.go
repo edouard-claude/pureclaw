@@ -2,14 +2,18 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
 	"github.com/edouard/pureclaw/internal/llm"
 	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
+	"github.com/edouard/pureclaw/internal/tool"
 	"github.com/edouard/pureclaw/internal/workspace"
 )
+
+const maxToolRounds = 10
 
 // LLMClient abstracts the LLM provider for testability.
 type LLMClient interface {
@@ -32,6 +36,12 @@ type MemorySearcher interface {
 	ReadRange(ctx context.Context, start, end time.Time) ([]memory.SearchResult, error)
 }
 
+// ToolExecutor abstracts the tool registry for testability.
+type ToolExecutor interface {
+	Execute(ctx context.Context, name string, args json.RawMessage) tool.ToolResult
+	Definitions() []llm.Tool
+}
+
 // NewAgentConfig holds all dependencies for Agent construction.
 type NewAgentConfig struct {
 	Workspace      *workspace.Workspace
@@ -39,6 +49,7 @@ type NewAgentConfig struct {
 	Sender         Sender
 	Memory         MemoryWriter
 	MemorySearcher MemorySearcher
+	ToolExecutor   ToolExecutor
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
@@ -48,6 +59,7 @@ type Agent struct {
 	sender         Sender
 	memory         MemoryWriter
 	memorySearcher MemorySearcher
+	toolExecutor   ToolExecutor
 	history        []llm.Message
 }
 
@@ -59,6 +71,7 @@ func New(cfg NewAgentConfig) *Agent {
 		sender:         cfg.Sender,
 		memory:         cfg.Memory,
 		memorySearcher: cfg.MemorySearcher,
+		toolExecutor:   cfg.ToolExecutor,
 	}
 }
 
@@ -102,28 +115,60 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 	a.logMemory(ctx, "owner", msg.Message.Text)
 
 	msgs := a.buildMessages(msg.Message.Text)
-	resp, err := a.llm.ChatCompletionWithRetry(ctx, msgs, nil)
-	if err != nil {
-		slog.Error("LLM call failed",
+	tools := a.toolDefinitions()
+
+	var resp *llm.ChatResponse
+	var err error
+
+	for round := range maxToolRounds {
+		resp, err = a.llm.ChatCompletionWithRetry(ctx, msgs, tools)
+		if err != nil {
+			slog.Error("LLM call failed",
+				"component", "agent",
+				"operation", "handle_message",
+				"error", err,
+			)
+			return
+		}
+
+		if len(resp.Choices) == 0 {
+			slog.Error("LLM returned no choices",
+				"component", "agent",
+				"operation", "handle_message",
+			)
+			return
+		}
+
+		if !llm.HasToolCalls(&resp.Choices[0]) {
+			break
+		}
+
+		if a.toolExecutor == nil {
+			slog.Warn("LLM returned tool calls but no executor configured",
+				"component", "agent",
+				"operation", "handle_message",
+			)
+			return
+		}
+
+		toolMsgs := a.executeToolCalls(ctx, resp.Choices[0].Message)
+		msgs = append(msgs, resp.Choices[0].Message)
+		msgs = append(msgs, toolMsgs...)
+
+		slog.Info("tool round completed",
 			"component", "agent",
 			"operation", "handle_message",
-			"error", err,
+			"round", round+1,
+			"tool_calls", len(resp.Choices[0].Message.ToolCalls),
 		)
-		return
 	}
 
-	if len(resp.Choices) == 0 {
-		slog.Error("LLM returned no choices",
-			"component", "agent",
-			"operation", "handle_message",
-		)
-		return
-	}
-
+	// Check if loop exhausted without a text response.
 	if llm.HasToolCalls(&resp.Choices[0]) {
-		slog.Warn("LLM returned tool calls but tools are not supported yet",
+		slog.Warn("max tool rounds exceeded without final response",
 			"component", "agent",
 			"operation", "handle_message",
+			"max_rounds", maxToolRounds,
 		)
 		return
 	}
@@ -161,13 +206,41 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 			"component", "agent",
 			"operation", "handle_message",
 		)
-	default:
-		slog.Warn("unknown response type",
+	}
+}
+
+// executeToolCalls runs each tool call and returns tool result messages.
+func (a *Agent) executeToolCalls(ctx context.Context, assistantMsg llm.Message) []llm.Message {
+	var toolMsgs []llm.Message
+	for _, tc := range assistantMsg.ToolCalls {
+		result := a.toolExecutor.Execute(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+
+		resultJSON, _ := json.Marshal(result)
+
+		toolMsgs = append(toolMsgs, llm.Message{
+			Role:       "tool",
+			Content:    string(resultJSON),
+			Name:       tc.Function.Name,
+			ToolCallID: tc.ID,
+		})
+
+		slog.Info("tool executed",
 			"component", "agent",
-			"operation", "handle_message",
-			"type", agentResp.Type,
+			"operation", "execute_tool",
+			"tool_name", tc.Function.Name,
+			"tool_call_id", tc.ID,
+			"success", result.Success,
 		)
 	}
+	return toolMsgs
+}
+
+// toolDefinitions returns LLM tool definitions if a tool executor is configured.
+func (a *Agent) toolDefinitions() []llm.Tool {
+	if a.toolExecutor == nil {
+		return nil
+	}
+	return a.toolExecutor.Definitions()
 }
 
 func (a *Agent) logMemory(ctx context.Context, source, content string) {

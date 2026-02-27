@@ -6,6 +6,7 @@
 # Test coverage
 coverage.out
 cover.out
+coverage_*.out
 
 # Environment
 .env

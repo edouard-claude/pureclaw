@@ -15,6 +15,7 @@ import (
 	"github.com/edouard/pureclaw/internal/llm"
 	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
+	"github.com/edouard/pureclaw/internal/tool"
 	"github.com/edouard/pureclaw/internal/vault"
 	"github.com/edouard/pureclaw/internal/workspace"
 )
@@ -131,6 +132,12 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	// 6a. Create memory (serves both writer and searcher)
 	mem := newMemory(cfg.Workspace)
 
+	// 6b. Create tool registry
+	registry := tool.NewRegistry()
+	registry.Register(tool.NewReadFile())
+	registry.Register(tool.NewWriteFile())
+	registry.Register(tool.NewListDir())
+
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
 		Workspace:      ws,
@@ -138,6 +145,7 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		Sender:         sender,
 		Memory:         mem,
 		MemorySearcher: mem,
+		ToolExecutor:   registry,
 	})
 
 	// 8. Signal handling

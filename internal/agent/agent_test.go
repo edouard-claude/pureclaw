@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/edouard/pureclaw/internal/llm"
 	"github.com/edouard/pureclaw/internal/telegram"
+	"github.com/edouard/pureclaw/internal/tool"
 	"github.com/edouard/pureclaw/internal/workspace"
 )
 
@@ -67,6 +69,34 @@ func (f *fakeMemoryWriter) Write(ctx context.Context, source, content string) er
 	return f.err
 }
 
+type toolExecCall struct {
+	name string
+	args json.RawMessage
+}
+
+type fakeToolExecutor struct {
+	results     []tool.ToolResult
+	calls       []toolExecCall
+	definitions []llm.Tool
+	callIdx     int
+}
+
+func (f *fakeToolExecutor) Execute(ctx context.Context, name string, args json.RawMessage) tool.ToolResult {
+	f.calls = append(f.calls, toolExecCall{name, args})
+	if f.callIdx < len(f.results) {
+		r := f.results[f.callIdx]
+		if f.callIdx < len(f.results)-1 {
+			f.callIdx++
+		}
+		return r
+	}
+	return tool.ToolResult{Success: true, Output: "ok"}
+}
+
+func (f *fakeToolExecutor) Definitions() []llm.Tool {
+	return f.definitions
+}
+
 // --- Helpers ---
 
 func testWorkspace(t *testing.T) *workspace.Workspace {
@@ -95,6 +125,39 @@ func newTestAgent(ws *workspace.Workspace, l LLMClient, s Sender) *Agent {
 		LLM:       l,
 		Sender:    s,
 	})
+}
+
+func newTestAgentWithTools(ws *workspace.Workspace, l LLMClient, s Sender, te ToolExecutor) *Agent {
+	return New(NewAgentConfig{
+		Workspace:    ws,
+		LLM:          l,
+		Sender:       s,
+		ToolExecutor: te,
+	})
+}
+
+func makeToolCallResponse(toolCalls ...llm.ToolCall) *llm.ChatResponse {
+	return &llm.ChatResponse{
+		Choices: []llm.Choice{{
+			Message: llm.Message{
+				Role:      "assistant",
+				Content:   "",
+				ToolCalls: toolCalls,
+			},
+			FinishReason: "tool_calls",
+		}},
+	}
+}
+
+func tc(id, name, args string) llm.ToolCall {
+	return llm.ToolCall{
+		ID:   id,
+		Type: "function",
+		Function: llm.ToolCallFunction{
+			Name:      name,
+			Arguments: args,
+		},
+	}
 }
 
 func sendAndWait(t *testing.T, ch chan telegram.TelegramMessage, msg telegram.TelegramMessage) {
@@ -421,9 +484,9 @@ func TestRun_ToolCallsReturned(t *testing.T) {
 	cancel()
 	<-done
 
-	// Should not send anything — tool calls not yet supported.
+	// Should not send anything — no tool executor configured.
 	if len(sender.sent) != 0 {
-		t.Fatalf("expected 0 sends for tool calls, got %d", len(sender.sent))
+		t.Fatalf("expected 0 sends for tool calls with nil executor, got %d", len(sender.sent))
 	}
 }
 
@@ -628,5 +691,449 @@ func TestRun_NilMemory(t *testing.T) {
 	// No panic, message sent normally.
 	if len(sender.sent) != 1 {
 		t.Fatalf("expected 1 sent message with nil memory, got %d", len(sender.sent))
+	}
+}
+
+func TestRun_IntrospectionFailure(t *testing.T) {
+	// Workspace without ## Environment and with non-writable root triggers introspection failure.
+	ws := &workspace.Workspace{
+		Root:    "/nonexistent/path/that/should/not/exist",
+		SoulMD:  "You are a test agent.",
+		AgentMD: "# Test Agent",
+	}
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	ag := newTestAgent(ws, llmFake, sender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	// Introspection fails but agent continues normally.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message despite introspection failure, got %d", len(sender.sent))
+	}
+}
+
+// --- Tool call loop tests ---
+
+func TestHandleMessage_SingleToolCall(t *testing.T) {
+	ws := testWorkspace(t)
+	// LLM returns tool call, then final text response.
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "read_file", `{"path":"/tmp/f"}`)),
+			makeResponse("message", "done reading"),
+		},
+	}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results: []tool.ToolResult{
+			{Success: true, Output: "file content"},
+		},
+		definitions: []llm.Tool{{Type: "function", Function: llm.ToolFunction{Name: "read_file"}}},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "read a file"))
+	cancel()
+	<-done
+
+	// Tool was executed.
+	if len(executor.calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(executor.calls))
+	}
+	if executor.calls[0].name != "read_file" {
+		t.Errorf("expected tool name %q, got %q", "read_file", executor.calls[0].name)
+	}
+
+	// Final message was sent.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "done reading" {
+		t.Errorf("expected text %q, got %q", "done reading", sender.sent[0].text)
+	}
+
+	// LLM was called twice: once with tools, once with tool result.
+	if len(llmFake.calls) != 2 {
+		t.Fatalf("expected 2 LLM calls, got %d", len(llmFake.calls))
+	}
+
+	// Second LLM call should include assistant tool_calls msg and tool result msg.
+	secondCall := llmFake.calls[1]
+	// Should have: system + user + assistant(tool_calls) + tool(result) = 4 messages.
+	if len(secondCall) != 4 {
+		t.Fatalf("second LLM call: expected 4 messages, got %d", len(secondCall))
+	}
+	if secondCall[2].Role != "assistant" {
+		t.Errorf("expected assistant role at idx 2, got %q", secondCall[2].Role)
+	}
+	if secondCall[3].Role != "tool" {
+		t.Errorf("expected tool role at idx 3, got %q", secondCall[3].Role)
+	}
+	if secondCall[3].ToolCallID != "call_1" {
+		t.Errorf("expected tool_call_id %q, got %q", "call_1", secondCall[3].ToolCallID)
+	}
+}
+
+func TestHandleMessage_MultipleToolCalls(t *testing.T) {
+	ws := testWorkspace(t)
+	// LLM returns 2 tool calls in one response, then text.
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(
+				tc("call_1", "read_file", `{"path":"a.txt"}`),
+				tc("call_2", "list_dir", `{"path":"/"}`),
+			),
+			makeResponse("message", "found 2 results"),
+		},
+	}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results: []tool.ToolResult{
+			{Success: true, Output: "content a"},
+			{Success: true, Output: "dir listing"},
+		},
+		definitions: []llm.Tool{},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "do stuff"))
+	cancel()
+	<-done
+
+	// Both tools executed.
+	if len(executor.calls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(executor.calls))
+	}
+	if executor.calls[0].name != "read_file" {
+		t.Errorf("expected first tool %q, got %q", "read_file", executor.calls[0].name)
+	}
+	if executor.calls[1].name != "list_dir" {
+		t.Errorf("expected second tool %q, got %q", "list_dir", executor.calls[1].name)
+	}
+
+	// Final message sent.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(sender.sent))
+	}
+
+	// Second LLM call should include: system + user + assistant(2 tool_calls) + 2 tool results = 5 messages.
+	if len(llmFake.calls) != 2 {
+		t.Fatalf("expected 2 LLM calls, got %d", len(llmFake.calls))
+	}
+	secondCall := llmFake.calls[1]
+	if len(secondCall) != 5 {
+		t.Fatalf("second LLM call: expected 5 messages, got %d", len(secondCall))
+	}
+}
+
+func TestHandleMessage_ChainedToolCalls(t *testing.T) {
+	ws := testWorkspace(t)
+	// LLM returns tool call → tool call → message (two rounds).
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "read_file", `{"path":"config.json"}`)),
+			makeToolCallResponse(tc("call_2", "write_file", `{"path":"out.txt","content":"data"}`)),
+			makeResponse("message", "done chaining"),
+		},
+	}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results: []tool.ToolResult{
+			{Success: true, Output: "config data"},
+			{Success: true, Output: "file written: out.txt"},
+		},
+		definitions: []llm.Tool{},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "chain tools"))
+	cancel()
+	<-done
+
+	// Two tool calls over two rounds.
+	if len(executor.calls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(executor.calls))
+	}
+
+	// 3 LLM calls total.
+	if len(llmFake.calls) != 3 {
+		t.Fatalf("expected 3 LLM calls, got %d", len(llmFake.calls))
+	}
+
+	// Final message sent.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "done chaining" {
+		t.Errorf("expected %q, got %q", "done chaining", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_MaxRoundsExceeded(t *testing.T) {
+	ws := testWorkspace(t)
+	// LLM always returns tool calls (never a text response).
+	toolResp := makeToolCallResponse(tc("call_x", "read_file", `{}`))
+	responses := make([]*llm.ChatResponse, maxToolRounds+1)
+	for i := range responses {
+		responses[i] = toolResp
+	}
+	llmFake := &fakeLLM{responses: responses}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results:     []tool.ToolResult{{Success: true, Output: "ok"}},
+		definitions: []llm.Tool{},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "infinite tools"))
+	cancel()
+	<-done
+
+	// Should have executed exactly maxToolRounds tool calls.
+	if len(executor.calls) != maxToolRounds {
+		t.Fatalf("expected %d tool calls, got %d", maxToolRounds, len(executor.calls))
+	}
+
+	// Should NOT have sent any message (loop exhausted without text response).
+	// The last response still has tool calls, so ParseAgentResponse will fail on empty content.
+	if len(sender.sent) != 0 {
+		t.Fatalf("expected 0 sends after max rounds, got %d", len(sender.sent))
+	}
+}
+
+func TestHandleMessage_NoToolExecutor_ToolCallsReturned(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "some_tool", "{}")),
+		},
+	}
+	sender := &fakeSender{}
+	// No tool executor — nil.
+	ag := newTestAgent(ws, llmFake, sender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	// Should not send anything — no executor configured.
+	if len(sender.sent) != 0 {
+		t.Fatalf("expected 0 sends with nil executor, got %d", len(sender.sent))
+	}
+}
+
+func TestHandleMessage_UnknownTool(t *testing.T) {
+	ws := testWorkspace(t)
+	// LLM calls unknown tool, then gets error result, then responds with text.
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "nonexistent_tool", "{}")),
+			makeResponse("message", "tool not found"),
+		},
+	}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results: []tool.ToolResult{
+			{Success: false, Error: "unknown tool: nonexistent_tool"},
+		},
+		definitions: []llm.Tool{},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "use unknown tool"))
+	cancel()
+	<-done
+
+	// Tool executor was called with the unknown tool name.
+	if len(executor.calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(executor.calls))
+	}
+	if executor.calls[0].name != "nonexistent_tool" {
+		t.Errorf("expected tool name %q, got %q", "nonexistent_tool", executor.calls[0].name)
+	}
+
+	// Error result was sent back to LLM, which then produced a message.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "tool not found" {
+		t.Errorf("expected %q, got %q", "tool not found", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_ToolsNilExistingBehavior(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "normal reply")}}
+	sender := &fakeSender{}
+	// No executor, LLM returns text — same as before.
+	ag := newTestAgent(ws, llmFake, sender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hello"))
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "normal reply" {
+		t.Errorf("expected %q, got %q", "normal reply", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_ToolDefinitionsPassedToLLM(t *testing.T) {
+	ws := testWorkspace(t)
+	toolDefs := []llm.Tool{
+		{Type: "function", Function: llm.ToolFunction{Name: "read_file", Description: "Read a file"}},
+		{Type: "function", Function: llm.ToolFunction{Name: "write_file", Description: "Write a file"}},
+	}
+
+	var capturedTools []llm.Tool
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "ok")}}
+	// Override to capture tools.
+	origChatFn := llmFake.ChatCompletionWithRetry
+	_ = origChatFn // suppress unused warning; we access the fake directly
+
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{definitions: toolDefs}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	// Intercept the tool definitions by checking what toolDefinitions() returns.
+	capturedTools = ag.toolDefinitions()
+	if len(capturedTools) != 2 {
+		t.Fatalf("expected 2 tool definitions, got %d", len(capturedTools))
+	}
+	if capturedTools[0].Function.Name != "read_file" {
+		t.Errorf("expected first tool %q, got %q", "read_file", capturedTools[0].Function.Name)
+	}
+	if capturedTools[1].Function.Name != "write_file" {
+		t.Errorf("expected second tool %q, got %q", "write_file", capturedTools[1].Function.Name)
+	}
+}
+
+func TestToolDefinitions_NilExecutor(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "ok")}}
+	sender := &fakeSender{}
+	ag := newTestAgent(ws, llmFake, sender)
+
+	defs := ag.toolDefinitions()
+	if defs != nil {
+		t.Fatalf("expected nil tool definitions with nil executor, got %v", defs)
+	}
+}
+
+func TestHandleMessage_LLMErrorDuringToolLoop(t *testing.T) {
+	ws := testWorkspace(t)
+	// First call returns tool call, second call fails.
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "read_file", `{}`)),
+		},
+		errs: []error{
+			nil,
+			errors.New("llm failure during tool loop"),
+		},
+	}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results:     []tool.ToolResult{{Success: true, Output: "ok"}},
+		definitions: []llm.Tool{},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "will fail"))
+	cancel()
+	<-done
+
+	// Tool was executed.
+	if len(executor.calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(executor.calls))
+	}
+	// But no message sent since LLM failed on second call.
+	if len(sender.sent) != 0 {
+		t.Fatalf("expected 0 sends after LLM error, got %d", len(sender.sent))
+	}
+}
+
+func TestHandleMessage_NoChoicesDuringToolLoop(t *testing.T) {
+	ws := testWorkspace(t)
+	// First call returns tool call, second returns no choices.
+	llmFake := &fakeLLM{
+		responses: []*llm.ChatResponse{
+			makeToolCallResponse(tc("call_1", "read_file", `{}`)),
+			{Choices: []llm.Choice{}},
+		},
+	}
+	sender := &fakeSender{}
+	executor := &fakeToolExecutor{
+		results:     []tool.ToolResult{{Success: true, Output: "ok"}},
+		definitions: []llm.Tool{},
+	}
+	ag := newTestAgentWithTools(ws, llmFake, sender, executor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "will get no choices"))
+	cancel()
+	<-done
+
+	// Tool was executed but no final message sent.
+	if len(executor.calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(executor.calls))
+	}
+	if len(sender.sent) != 0 {
+		t.Fatalf("expected 0 sends when no choices in tool loop, got %d", len(sender.sent))
 	}
 }
