@@ -13,6 +13,7 @@ import (
 	"github.com/edouard/pureclaw/internal/agent"
 	"github.com/edouard/pureclaw/internal/config"
 	"github.com/edouard/pureclaw/internal/llm"
+	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
 	"github.com/edouard/pureclaw/internal/vault"
 	"github.com/edouard/pureclaw/internal/workspace"
@@ -31,6 +32,7 @@ var (
 		return telegram.NewPoller(client, allowedIDs, timeout)
 	}
 	newSender = func(client *telegram.Client) agent.Sender { return telegram.NewSender(client) }
+	newMemory = func(root string) agent.MemoryWriter { return memory.New(root) }
 	newAgent  = agent.New
 	signalContext = func() (context.Context, context.CancelFunc) {
 		return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -126,11 +128,15 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	poller := newPoller(tgClient, cfg.TelegramAllowedIDs, 30)
 	sender := newSender(tgClient)
 
+	// 6a. Create memory writer
+	mem := newMemory(cfg.Workspace)
+
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
 		Workspace: ws,
 		LLM:       llmClient,
 		Sender:    sender,
+		Memory:    mem,
 	})
 
 	// 8. Signal handling

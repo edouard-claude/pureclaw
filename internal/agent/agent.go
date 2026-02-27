@@ -19,11 +19,17 @@ type Sender interface {
 	Send(ctx context.Context, chatID int64, text string) error
 }
 
+// MemoryWriter abstracts the memory persistence layer for testability.
+type MemoryWriter interface {
+	Write(ctx context.Context, source, content string) error
+}
+
 // NewAgentConfig holds all dependencies for Agent construction.
 type NewAgentConfig struct {
 	Workspace *workspace.Workspace
 	LLM       LLMClient
 	Sender    Sender
+	Memory    MemoryWriter
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
@@ -31,6 +37,7 @@ type Agent struct {
 	workspace *workspace.Workspace
 	llm       LLMClient
 	sender    Sender
+	memory    MemoryWriter
 	history   []llm.Message
 }
 
@@ -40,6 +47,7 @@ func New(cfg NewAgentConfig) *Agent {
 		workspace: cfg.Workspace,
 		llm:       cfg.LLM,
 		sender:    cfg.Sender,
+		memory:    cfg.Memory,
 	}
 }
 
@@ -70,6 +78,8 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 		"operation", "handle_message",
 		"chat_id", msg.Message.Chat.ID,
 	)
+
+	a.logMemory(ctx, "owner", msg.Message.Text)
 
 	msgs := a.buildMessages(msg.Message.Text)
 	resp, err := a.llm.ChatCompletionWithRetry(ctx, msgs, nil)
@@ -118,6 +128,7 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 				"error", err,
 			)
 		}
+		a.logMemory(ctx, "agent", agentResp.Content)
 		a.addToHistory(msg.Message.Text, agentResp.Content)
 	case "think":
 		slog.Debug("think response",
@@ -135,6 +146,20 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 			"component", "agent",
 			"operation", "handle_message",
 			"type", agentResp.Type,
+		)
+	}
+}
+
+func (a *Agent) logMemory(ctx context.Context, source, content string) {
+	if a.memory == nil {
+		return
+	}
+	if err := a.memory.Write(ctx, source, content); err != nil {
+		slog.Error("failed to write memory",
+			"component", "agent",
+			"operation", "log_memory",
+			"source", source,
+			"error", err,
 		)
 	}
 }

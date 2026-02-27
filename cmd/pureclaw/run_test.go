@@ -29,6 +29,7 @@ func saveRunVars(t *testing.T) {
 	origNewTGClient := newTGClient
 	origNewPoller := newPoller
 	origNewSender := newSender
+	origNewMemory := newMemory
 	origNewAgent := newAgent
 	origSignalContext := signalContext
 	origRunPollerFn := runPollerFn
@@ -42,6 +43,7 @@ func saveRunVars(t *testing.T) {
 		newTGClient = origNewTGClient
 		newPoller = origNewPoller
 		newSender = origNewSender
+		newMemory = origNewMemory
 		newAgent = origNewAgent
 		signalContext = origSignalContext
 		runPollerFn = origRunPollerFn
@@ -64,6 +66,13 @@ func (s *stubLLM) ChatCompletionWithRetry(ctx context.Context, messages []llm.Me
 type stubSender struct{}
 
 func (s *stubSender) Send(ctx context.Context, chatID int64, text string) error {
+	return nil
+}
+
+// stubMemoryWriter implements agent.MemoryWriter for testing run.go.
+type stubMemoryWriter struct{}
+
+func (s *stubMemoryWriter) Write(ctx context.Context, source, content string) error {
 	return nil
 }
 
@@ -101,6 +110,7 @@ func setupHappyPath(t *testing.T, dir string) {
 	// Replace clients with stubs that don't make network calls.
 	newLLMClient = func(apiKey, model string) agent.LLMClient { return &stubLLM{} }
 	newSender = func(client *telegram.Client) agent.Sender { return &stubSender{} }
+	newMemory = func(root string) agent.MemoryWriter { return &stubMemoryWriter{} }
 }
 
 func TestRunAgent_ConfigLoadError(t *testing.T) {

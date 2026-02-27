@@ -52,6 +52,21 @@ func (f *fakeSender) Send(ctx context.Context, chatID int64, text string) error 
 	return f.err
 }
 
+type memoryEntry struct {
+	source  string
+	content string
+}
+
+type fakeMemoryWriter struct {
+	entries []memoryEntry
+	err     error
+}
+
+func (f *fakeMemoryWriter) Write(ctx context.Context, source, content string) error {
+	f.entries = append(f.entries, memoryEntry{source, content})
+	return f.err
+}
+
 // --- Helpers ---
 
 func testWorkspace(t *testing.T) *workspace.Workspace {
@@ -454,5 +469,164 @@ func TestRun_NoChoices(t *testing.T) {
 
 	if len(sender.sent) != 0 {
 		t.Fatalf("expected 0 sends when no choices, got %d", len(sender.sent))
+	}
+}
+
+// --- Memory integration tests ---
+
+func TestRun_MessageLogsOwnerAndAgent(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello back")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+	ag := New(NewAgentConfig{Workspace: ws, LLM: llmFake, Sender: sender, Memory: mem})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	if len(mem.entries) != 2 {
+		t.Fatalf("expected 2 memory entries, got %d", len(mem.entries))
+	}
+	if mem.entries[0].source != "owner" || mem.entries[0].content != "hi" {
+		t.Errorf("entry[0] = %+v, want {owner, hi}", mem.entries[0])
+	}
+	if mem.entries[1].source != "agent" || mem.entries[1].content != "hello back" {
+		t.Errorf("entry[1] = %+v, want {agent, hello back}", mem.entries[1])
+	}
+}
+
+func TestRun_ThinkLogsOwnerOnly(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("think", "reasoning")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+	ag := New(NewAgentConfig{Workspace: ws, LLM: llmFake, Sender: sender, Memory: mem})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	if len(mem.entries) != 1 {
+		t.Fatalf("expected 1 memory entry for think, got %d", len(mem.entries))
+	}
+	if mem.entries[0].source != "owner" {
+		t.Errorf("expected source 'owner', got %q", mem.entries[0].source)
+	}
+}
+
+func TestRun_NoopLogsOwnerOnly(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+	ag := New(NewAgentConfig{Workspace: ws, LLM: llmFake, Sender: sender, Memory: mem})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	if len(mem.entries) != 1 {
+		t.Fatalf("expected 1 memory entry for noop, got %d", len(mem.entries))
+	}
+	if mem.entries[0].source != "owner" {
+		t.Errorf("expected source 'owner', got %q", mem.entries[0].source)
+	}
+}
+
+func TestRun_SendErrorStillLogsMemory(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{err: errors.New("send failure")}
+	mem := &fakeMemoryWriter{}
+	ag := New(NewAgentConfig{Workspace: ws, LLM: llmFake, Sender: sender, Memory: mem})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	// Memory should log both owner and agent even when send fails.
+	if len(mem.entries) != 2 {
+		t.Fatalf("expected 2 memory entries despite send error, got %d", len(mem.entries))
+	}
+	if mem.entries[0].source != "owner" || mem.entries[0].content != "hi" {
+		t.Errorf("entry[0] = %+v, want {owner, hi}", mem.entries[0])
+	}
+	if mem.entries[1].source != "agent" || mem.entries[1].content != "hello" {
+		t.Errorf("entry[1] = %+v, want {agent, hello}", mem.entries[1])
+	}
+}
+
+func TestRun_MemoryWriteError(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{err: errors.New("disk full")}
+	ag := New(NewAgentConfig{Workspace: ws, LLM: llmFake, Sender: sender, Memory: mem})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	// Memory errors must not crash the agent or prevent sending.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message despite memory error, got %d", len(sender.sent))
+	}
+	// Both Write calls should still have been attempted despite errors.
+	if len(mem.entries) != 2 {
+		t.Fatalf("expected 2 memory write attempts despite errors, got %d", len(mem.entries))
+	}
+}
+
+func TestRun_NilMemory(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	// Explicitly pass nil Memory.
+	ag := New(NewAgentConfig{Workspace: ws, LLM: llmFake, Sender: sender, Memory: nil})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	// No panic, message sent normally.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message with nil memory, got %d", len(sender.sent))
 	}
 }
