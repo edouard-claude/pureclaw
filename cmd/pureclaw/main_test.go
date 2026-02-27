@@ -11,7 +11,7 @@ import (
 
 func TestRun_version(t *testing.T) {
 	var stdout bytes.Buffer
-	code := run([]string{"pureclaw", "version"}, &stdout, io.Discard)
+	code := run([]string{"pureclaw", "version"}, strings.NewReader(""), &stdout, io.Discard)
 
 	if code != 0 {
 		t.Fatalf("expected exit code 0, got %d", code)
@@ -23,28 +23,54 @@ func TestRun_version(t *testing.T) {
 }
 
 func TestRun_noArgs(t *testing.T) {
-	code := run([]string{"pureclaw"}, io.Discard, io.Discard)
+	code := run([]string{"pureclaw"}, strings.NewReader(""), io.Discard, io.Discard)
 	if code != 1 {
 		t.Fatalf("expected exit code 1, got %d", code)
 	}
 }
 
 func TestRun_unknownCommand(t *testing.T) {
-	code := run([]string{"pureclaw", "bogus"}, io.Discard, io.Discard)
+	code := run([]string{"pureclaw", "bogus"}, strings.NewReader(""), io.Discard, io.Discard)
 	if code != 1 {
 		t.Fatalf("expected exit code 1, got %d", code)
 	}
 }
 
 func TestRun_unimplementedCommands(t *testing.T) {
-	cmds := []string{"init", "run", "vault"}
+	cmds := []string{"init", "run"}
 	for _, cmd := range cmds {
 		t.Run(cmd, func(t *testing.T) {
-			code := run([]string{"pureclaw", cmd}, io.Discard, io.Discard)
+			code := run([]string{"pureclaw", cmd}, strings.NewReader(""), io.Discard, io.Discard)
 			if code != 1 {
 				t.Fatalf("expected exit code 1 for unimplemented %q, got %d", cmd, code)
 			}
 		})
+	}
+}
+
+func TestRun_vaultNoSubcommand(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"pureclaw", "vault"}, strings.NewReader(""), io.Discard, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "Usage:") {
+		t.Fatalf("expected vault usage, got %q", stderr.String())
+	}
+}
+
+func TestRun_vaultSubcommandDelegation(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	var stdout, stderr bytes.Buffer
+	input := "test-pass\ntest-value\n"
+	code := run([]string{"pureclaw", "vault", "set", "my_key"}, strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Secret stored: my_key") {
+		t.Fatalf("expected confirmation, got %q", stderr.String())
 	}
 }
 

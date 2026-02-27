@@ -10,10 +10,10 @@ import (
 var Version = "dev"
 
 func main() {
-	os.Exit(run(os.Args, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args, os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout io.Writer, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
 	if len(args) < 2 {
 		printUsage(stderr)
 		return 1
@@ -29,8 +29,11 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "run: not yet implemented")
 		return 1
 	case "vault":
-		fmt.Fprintln(stderr, "vault: not yet implemented")
-		return 1
+		if len(args) < 3 {
+			printVaultUsage(stderr)
+			return 1
+		}
+		return runVault(args[2:], stdin, stdout, stderr)
 	default:
 		printUsage(stderr)
 		return 1
