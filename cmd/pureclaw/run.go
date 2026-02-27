@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/edouard/pureclaw/internal/agent"
 	"github.com/edouard/pureclaw/internal/config"
@@ -17,6 +18,7 @@ import (
 	"github.com/edouard/pureclaw/internal/telegram"
 	"github.com/edouard/pureclaw/internal/tool"
 	"github.com/edouard/pureclaw/internal/vault"
+	"github.com/edouard/pureclaw/internal/watcher"
 	"github.com/edouard/pureclaw/internal/workspace"
 )
 
@@ -123,16 +125,20 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// 6. Create clients
+	// 6. Create file watcher for workspace hot-reload
+	fileChanges := make(chan struct{}, 1)
+	w := watcher.New(cfg.Workspace, 2*time.Second)
+
+	// 6a. Create clients
 	llmClient := newLLMClient(mistralKey, cfg.ModelText)
 	tgClient := newTGClient(telegramToken)
 	poller := newPoller(tgClient, cfg.TelegramAllowedIDs, 30)
 	sender := newSender(tgClient)
 
-	// 6a. Create memory (serves both writer and searcher)
+	// 6b. Create memory (serves both writer and searcher)
 	mem := newMemory(cfg.Workspace)
 
-	// 6b. Extract vault secret values for exec_command sanitization (NFR9)
+	// 6c. Extract vault secret values for exec_command sanitization (NFR9)
 	keys := v.List()
 	secrets := make([]string, 0, len(keys))
 	for _, k := range keys {
@@ -151,7 +157,7 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// 6c. Create tool registry
+	// 6d. Create tool registry
 	registry := tool.NewRegistry()
 	registry.Register(tool.NewReadFile())
 	registry.Register(tool.NewWriteFile())
@@ -167,17 +173,21 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		Memory:         mem,
 		MemorySearcher: mem,
 		ToolExecutor:   registry,
+		FileChanges:    fileChanges,
 	})
 
 	// 8. Signal handling
 	ctx, stop := signalContext()
 	defer stop()
 
-	// 9. Start poller goroutine
+	// 9. Start watcher goroutine
+	go w.Run(ctx, fileChanges)
+
+	// 10. Start poller goroutine
 	messages := make(chan telegram.TelegramMessage, 1)
 	runPollerFn(ctx, poller, messages)
 
-	// 10. Run event loop (blocks until ctx cancelled)
+	// 11. Run event loop (blocks until ctx cancelled)
 	slog.Info("agent started",
 		"component", "cmd",
 		"operation", "run",

@@ -1137,3 +1137,122 @@ func TestHandleMessage_NoChoicesDuringToolLoop(t *testing.T) {
 		t.Fatalf("expected 0 sends when no choices in tool loop, got %d", len(sender.sent))
 	}
 }
+
+// --- File change tests ---
+
+func TestHandleFileChange_Success(t *testing.T) {
+	ws := testWorkspace(t)
+	original := ws.AgentMD
+
+	origLoad := agentWorkspaceLoadFn
+	agentWorkspaceLoadFn = func(root string) (*workspace.Workspace, error) {
+		return &workspace.Workspace{
+			Root:    root,
+			AgentMD: "updated agent",
+			SoulMD:  "updated soul",
+		}, nil
+	}
+	defer func() { agentWorkspaceLoadFn = origLoad }()
+
+	ag := New(NewAgentConfig{Workspace: ws, LLM: &fakeLLM{}, Sender: &fakeSender{}})
+	ag.handleFileChange(context.Background())
+
+	if ws.AgentMD == original {
+		t.Error("expected workspace to be updated after handleFileChange")
+	}
+	if ws.AgentMD != "updated agent" {
+		t.Errorf("expected AgentMD %q, got %q", "updated agent", ws.AgentMD)
+	}
+	if ws.SoulMD != "updated soul" {
+		t.Errorf("expected SoulMD %q, got %q", "updated soul", ws.SoulMD)
+	}
+}
+
+func TestHandleFileChange_Error(t *testing.T) {
+	ws := testWorkspace(t)
+	originalAgent := ws.AgentMD
+	originalSoul := ws.SoulMD
+
+	origLoad := agentWorkspaceLoadFn
+	agentWorkspaceLoadFn = func(root string) (*workspace.Workspace, error) {
+		return nil, errors.New("load failed")
+	}
+	defer func() { agentWorkspaceLoadFn = origLoad }()
+
+	ag := New(NewAgentConfig{Workspace: ws, LLM: &fakeLLM{}, Sender: &fakeSender{}})
+	ag.handleFileChange(context.Background())
+
+	if ws.AgentMD != originalAgent {
+		t.Errorf("expected AgentMD preserved %q, got %q", originalAgent, ws.AgentMD)
+	}
+	if ws.SoulMD != originalSoul {
+		t.Errorf("expected SoulMD preserved %q, got %q", originalSoul, ws.SoulMD)
+	}
+}
+
+func TestRun_FileChangeEvent(t *testing.T) {
+	ws := testWorkspace(t)
+
+	origLoad := agentWorkspaceLoadFn
+	loadCalled := false
+	agentWorkspaceLoadFn = func(root string) (*workspace.Workspace, error) {
+		loadCalled = true
+		return &workspace.Workspace{
+			Root:    root,
+			AgentMD: "reloaded",
+			SoulMD:  "reloaded soul",
+		}, nil
+	}
+	defer func() { agentWorkspaceLoadFn = origLoad }()
+
+	fileChanges := make(chan struct{}, 1)
+	ag := New(NewAgentConfig{
+		Workspace:   ws,
+		LLM:         &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "ok")}},
+		Sender:      &fakeSender{},
+		FileChanges: fileChanges,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	fileChanges <- struct{}{}
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	<-done
+
+	if !loadCalled {
+		t.Error("expected agentWorkspaceLoadFn to be called on file change event")
+	}
+	if ws.AgentMD != "reloaded" {
+		t.Errorf("expected workspace updated to %q, got %q", "reloaded", ws.AgentMD)
+	}
+}
+
+func TestRun_NilFileChanges(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	ag := newTestAgent(ws, llmFake, sender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "hi"))
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 sent message with nil FileChanges, got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "hello" {
+		t.Errorf("expected text %q, got %q", "hello", sender.sent[0].text)
+	}
+}

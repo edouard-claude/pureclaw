@@ -15,6 +15,9 @@ import (
 
 const maxToolRounds = 10
 
+// Replaceable for testing.
+var agentWorkspaceLoadFn = workspace.Load
+
 // LLMClient abstracts the LLM provider for testability.
 type LLMClient interface {
 	ChatCompletionWithRetry(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error)
@@ -50,6 +53,7 @@ type NewAgentConfig struct {
 	Memory         MemoryWriter
 	MemorySearcher MemorySearcher
 	ToolExecutor   ToolExecutor
+	FileChanges    <-chan struct{}
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
@@ -60,6 +64,7 @@ type Agent struct {
 	memory         MemoryWriter
 	memorySearcher MemorySearcher
 	toolExecutor   ToolExecutor
+	fileChanges    <-chan struct{}
 	history        []llm.Message
 }
 
@@ -72,6 +77,7 @@ func New(cfg NewAgentConfig) *Agent {
 		memory:         cfg.Memory,
 		memorySearcher: cfg.MemorySearcher,
 		toolExecutor:   cfg.ToolExecutor,
+		fileChanges:    cfg.FileChanges,
 	}
 }
 
@@ -94,6 +100,8 @@ func (a *Agent) Run(ctx context.Context, messages <-chan telegram.TelegramMessag
 			return nil
 		case msg := <-messages:
 			a.handleMessage(ctx, msg)
+		case <-a.fileChanges:
+			a.handleFileChange(ctx)
 		}
 	}
 }
@@ -241,6 +249,32 @@ func (a *Agent) toolDefinitions() []llm.Tool {
 		return nil
 	}
 	return a.toolExecutor.Definitions()
+}
+
+// handleFileChange reloads the workspace from disk after a file change is detected.
+func (a *Agent) handleFileChange(ctx context.Context) {
+	slog.Info("workspace file change detected",
+		"component", "agent",
+		"operation", "file_change",
+	)
+
+	newWS, err := agentWorkspaceLoadFn(a.workspace.Root)
+	if err != nil {
+		slog.Error("workspace reload failed on file change",
+			"component", "agent",
+			"operation", "file_change",
+			"error", err,
+		)
+		return
+	}
+
+	*a.workspace = *newWS
+
+	slog.Info("workspace hot-reloaded",
+		"component", "agent",
+		"operation", "file_change",
+		"skills", len(a.workspace.Skills),
+	)
 }
 
 func (a *Agent) logMemory(ctx context.Context, source, content string) {
