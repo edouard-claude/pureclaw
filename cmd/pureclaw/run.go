@@ -32,7 +32,7 @@ var (
 		return telegram.NewPoller(client, allowedIDs, timeout)
 	}
 	newSender = func(client *telegram.Client) agent.Sender { return telegram.NewSender(client) }
-	newMemory = func(root string) agent.MemoryWriter { return memory.New(root) }
+	newMemory = func(root string) *memory.Memory { return memory.New(root) }
 	newAgent  = agent.New
 	signalContext = func() (context.Context, context.CancelFunc) {
 		return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -128,15 +128,16 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 	poller := newPoller(tgClient, cfg.TelegramAllowedIDs, 30)
 	sender := newSender(tgClient)
 
-	// 6a. Create memory writer
+	// 6a. Create memory (serves both writer and searcher)
 	mem := newMemory(cfg.Workspace)
 
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
-		Workspace: ws,
-		LLM:       llmClient,
-		Sender:    sender,
-		Memory:    mem,
+		Workspace:      ws,
+		LLM:            llmClient,
+		Sender:         sender,
+		Memory:         mem,
+		MemorySearcher: mem,
 	})
 
 	// 8. Signal handling

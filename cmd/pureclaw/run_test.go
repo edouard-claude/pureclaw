@@ -13,6 +13,7 @@ import (
 	"github.com/edouard/pureclaw/internal/agent"
 	"github.com/edouard/pureclaw/internal/config"
 	"github.com/edouard/pureclaw/internal/llm"
+	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
 	"github.com/edouard/pureclaw/internal/vault"
 )
@@ -69,13 +70,6 @@ func (s *stubSender) Send(ctx context.Context, chatID int64, text string) error 
 	return nil
 }
 
-// stubMemoryWriter implements agent.MemoryWriter for testing run.go.
-type stubMemoryWriter struct{}
-
-func (s *stubMemoryWriter) Write(ctx context.Context, source, content string) error {
-	return nil
-}
-
 // fakeVault creates a real test vault in dir.
 func fakeVault(t *testing.T, dir string) {
 	t.Helper()
@@ -110,7 +104,7 @@ func setupHappyPath(t *testing.T, dir string) {
 	// Replace clients with stubs that don't make network calls.
 	newLLMClient = func(apiKey, model string) agent.LLMClient { return &stubLLM{} }
 	newSender = func(client *telegram.Client) agent.Sender { return &stubSender{} }
-	newMemory = func(root string) agent.MemoryWriter { return &stubMemoryWriter{} }
+	newMemory = func(root string) *memory.Memory { return memory.New(root) }
 }
 
 func TestRunAgent_ConfigLoadError(t *testing.T) {

@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/edouard/pureclaw/internal/llm"
+	"github.com/edouard/pureclaw/internal/memory"
 	"github.com/edouard/pureclaw/internal/telegram"
 	"github.com/edouard/pureclaw/internal/workspace"
 )
@@ -24,30 +26,39 @@ type MemoryWriter interface {
 	Write(ctx context.Context, source, content string) error
 }
 
+// MemorySearcher abstracts memory search and temporal reading capabilities.
+type MemorySearcher interface {
+	Search(ctx context.Context, keyword string, start, end time.Time) ([]memory.SearchResult, error)
+	ReadRange(ctx context.Context, start, end time.Time) ([]memory.SearchResult, error)
+}
+
 // NewAgentConfig holds all dependencies for Agent construction.
 type NewAgentConfig struct {
-	Workspace *workspace.Workspace
-	LLM       LLMClient
-	Sender    Sender
-	Memory    MemoryWriter
+	Workspace      *workspace.Workspace
+	LLM            LLMClient
+	Sender         Sender
+	Memory         MemoryWriter
+	MemorySearcher MemorySearcher
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
 type Agent struct {
-	workspace *workspace.Workspace
-	llm       LLMClient
-	sender    Sender
-	memory    MemoryWriter
-	history   []llm.Message
+	workspace      *workspace.Workspace
+	llm            LLMClient
+	sender         Sender
+	memory         MemoryWriter
+	memorySearcher MemorySearcher
+	history        []llm.Message
 }
 
 // New creates a new Agent with the given dependencies.
 func New(cfg NewAgentConfig) *Agent {
 	return &Agent{
-		workspace: cfg.Workspace,
-		llm:       cfg.LLM,
-		sender:    cfg.Sender,
-		memory:    cfg.Memory,
+		workspace:      cfg.Workspace,
+		llm:            cfg.LLM,
+		sender:         cfg.Sender,
+		memory:         cfg.Memory,
+		memorySearcher: cfg.MemorySearcher,
 	}
 }
 
