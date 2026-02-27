@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -46,6 +48,7 @@ var (
 	runPollerFn = func(ctx context.Context, p *telegram.Poller, ch chan<- telegram.TelegramMessage) {
 		go p.Run(ctx, ch)
 	}
+	osExecutable = os.Executable
 )
 
 func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
@@ -184,8 +187,34 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		)
 	}
 
-	// 6f. Create sub-agent result channel for event loop integration.
+	// 6f. Create sub-agent result channel and runner for event loop integration.
 	subAgentResults := make(chan subagent.SubAgentResult, 1)
+	runner := subagent.NewRunner()
+
+	// 6g. Determine binary path for sub-agent subprocess launch.
+	binaryPath, err := osExecutable()
+	if err != nil {
+		slog.Error("failed to determine binary path",
+			"component", "cmd",
+			"operation", "run",
+			"error", err,
+		)
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// 6h. Register spawn_agent tool.
+	agentsDir := filepath.Join(cfg.Workspace, "agents")
+	registry.Register(tool.NewSpawnAgent(tool.SpawnAgentDeps{
+		Runner:          runner,
+		ParentWorkspace: ws,
+		ResultCh:        subAgentResults,
+		BinaryPath:      binaryPath,
+		ConfigPath:      defaultConfigPath,
+		VaultPath:       defaultVaultPath,
+		Timeout:         cfg.SubAgentTimeout.Duration,
+		AgentsDir:       agentsDir,
+	}))
 
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
@@ -201,9 +230,8 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		Transcriber:     audioClient,
 		VoiceDownloader: tgClient,
 		SubAgentResults: subAgentResults,
+		OwnerIDs:        cfg.TelegramAllowedIDs,
 	})
-	// Store subAgentResults channel for later use by spawn_agent tool (Story 6.3).
-	_ = subAgentResults
 
 	// 8. Signal handling
 	ctx, stop := signalContext()

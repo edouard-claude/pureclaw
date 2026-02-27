@@ -2125,6 +2125,451 @@ func TestRun_SubAgentResultTimedOutWithPartialResult(t *testing.T) {
 	}
 }
 
+// --- Sub-Agent Result Telegram Notification Tests ---
+
+func TestHandleSubAgentResult_Success_SendsTelegram(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{123},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "success-task",
+		WorkspacePath: "/tmp/workspace",
+		ResultContent: "task completed with findings",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// Verify Telegram message sent.
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	if sender.sent[0].chatID != 123 {
+		t.Errorf("chatID = %d, want 123", sender.sent[0].chatID)
+	}
+	if !strings.Contains(sender.sent[0].text, "success-task") {
+		t.Errorf("text should contain task_id, got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "completed") {
+		t.Errorf("text should contain 'completed', got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "task completed with findings") {
+		t.Errorf("text should contain result content, got %q", sender.sent[0].text)
+	}
+}
+
+func TestHandleSubAgentResult_TimeoutPartialResult_SendsTelegram(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{456},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "timeout-partial-task",
+		TimedOut:      true,
+		Err:           errors.New("timed out"),
+		ResultContent: "partial work done here",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "timed out") {
+		t.Errorf("text should contain 'timed out', got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "partial") {
+		t.Errorf("text should contain 'partial', got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "partial work done here") {
+		t.Errorf("text should contain partial result content, got %q", sender.sent[0].text)
+	}
+}
+
+func TestHandleSubAgentResult_TimeoutNoResult_SendsTelegram(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{789},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:   "timeout-noresult-task",
+		TimedOut: true,
+		Err:      errors.New("timed out"),
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "timed out") {
+		t.Errorf("text should contain 'timed out', got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "no result") {
+		t.Errorf("text should contain 'no result', got %q", sender.sent[0].text)
+	}
+}
+
+func TestHandleSubAgentResult_Error_SendsTelegram(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{321},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID: "error-task-tg",
+		Err:    errors.New("process crashed"),
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "failed") {
+		t.Errorf("text should contain 'failed', got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "process crashed") {
+		t.Errorf("text should contain error message, got %q", sender.sent[0].text)
+	}
+}
+
+func TestHandleSubAgentResult_NilSender_NoPanic(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          nil, // Sub-agent mode: no sender
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{999},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "nil-sender-task",
+		ResultContent: "some result",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// Memory should still be logged.
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" && strings.Contains(e.content, "nil-sender-task") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent-result memory entry even with nil sender")
+	}
+}
+
+func TestHandleSubAgentResult_LongResult_Truncated(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{100},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	// Create a result larger than 3500 chars.
+	longResult := strings.Repeat("x", 4000)
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "long-result-task",
+		ResultContent: longResult,
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "[...truncated]") {
+		t.Errorf("text should contain '[...truncated]', got length %d", len(sender.sent[0].text))
+	}
+	// Telegram message should not contain the full 4000 chars content.
+	if len(sender.sent[0].text) > 4096 {
+		t.Errorf("text length = %d, should be <= 4096", len(sender.sent[0].text))
+	}
+}
+
+func TestHandleSubAgentResult_NoOwnerIDs_NoTelegramSent(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        nil, // No owner IDs
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "no-owner-task",
+		ResultContent: "some result",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// No messages sent (ownerIDs is nil/empty).
+	if len(sender.sent) != 0 {
+		t.Errorf("sender.sent = %d, want 0 (no ownerIDs)", len(sender.sent))
+	}
+	// Memory should still be logged.
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent-result memory entry")
+	}
+}
+
+func TestHandleSubAgentResult_SenderError_LogsButContinues(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{err: errors.New("network error")}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{111},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "sender-err-task",
+		ResultContent: "result data",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// Send was attempted despite error.
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	// Memory still logged.
+	found := false
+	for _, e := range mem.entries {
+		if e.source == "sub-agent-result" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected sub-agent-result memory entry even with sender error")
+	}
+}
+
+func TestHandleSubAgentResult_EmptyContent_ClearMessage(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("noop", "")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+
+	subResults := make(chan subagent.SubAgentResult, 1)
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		SubAgentResults: subResults,
+		OwnerIDs:        []int64{200},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	subResults <- subagent.SubAgentResult{
+		TaskID:        "empty-content-task",
+		ResultContent: "", // Success but no content
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sender.sent = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "no output produced") {
+		t.Errorf("text should contain 'no output produced', got %q", sender.sent[0].text)
+	}
+	if !strings.Contains(sender.sent[0].text, "empty-content-task") {
+		t.Errorf("text should contain task_id, got %q", sender.sent[0].text)
+	}
+}
+
+func TestTruncateForTelegram_Short(t *testing.T) {
+	result := truncateForTelegram("short text")
+	if result != "short text" {
+		t.Errorf("truncateForTelegram(%q) = %q, want %q", "short text", result, "short text")
+	}
+}
+
+func TestTruncateForTelegram_ExactLimit(t *testing.T) {
+	text := strings.Repeat("a", 3500)
+	result := truncateForTelegram(text)
+	if result != text {
+		t.Errorf("expected text unchanged at exact limit")
+	}
+}
+
+func TestTruncateForTelegram_Long(t *testing.T) {
+	text := strings.Repeat("b", 4000)
+	result := truncateForTelegram(text)
+	if !strings.HasSuffix(result, "[...truncated]") {
+		t.Error("expected truncation marker")
+	}
+	runes := []rune(result)
+	// 3500 runes + len("\n\n[...truncated]") = ~3516 runes
+	if len(runes) > 3520 {
+		t.Errorf("result rune count = %d, expected <= ~3516", len(runes))
+	}
+}
+
+func TestTruncateForTelegram_MultiByteUTF8(t *testing.T) {
+	// "é" is 2 bytes in UTF-8 — verify we truncate on rune boundary, not byte boundary.
+	text := strings.Repeat("é", 3600)
+	result := truncateForTelegram(text)
+	if !strings.HasSuffix(result, "[...truncated]") {
+		t.Error("expected truncation marker")
+	}
+	// Verify the result is valid UTF-8 (no split multi-byte chars).
+	runes := []rune(result)
+	suffix := len([]rune("\n\n[...truncated]"))
+	contentRunes := len(runes) - suffix
+	if contentRunes != 3500 {
+		t.Errorf("content runes = %d, want 3500", contentRunes)
+	}
+}
+
 func TestRunSubAgent_ExhaustedToolRounds(t *testing.T) {
 	ws := testWorkspace(t)
 	// LLM always returns tool calls, never a final text response.

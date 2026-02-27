@@ -79,6 +79,7 @@ type NewAgentConfig struct {
 	Transcriber     Transcriber
 	VoiceDownloader VoiceDownloader
 	SubAgentResults <-chan subagent.SubAgentResult
+	OwnerIDs        []int64 // Telegram chat IDs for unsolicited messages (sub-agent results)
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
@@ -95,6 +96,7 @@ type Agent struct {
 	transcriber     Transcriber
 	voiceDownloader VoiceDownloader
 	subAgentResults <-chan subagent.SubAgentResult
+	ownerIDs        []int64 // Telegram chat IDs for unsolicited messages
 	history         []llm.Message
 }
 
@@ -113,6 +115,7 @@ func New(cfg NewAgentConfig) *Agent {
 		transcriber:     cfg.Transcriber,
 		voiceDownloader: cfg.VoiceDownloader,
 		subAgentResults: cfg.SubAgentResults,
+		ownerIDs:        cfg.OwnerIDs,
 	}
 }
 
@@ -405,25 +408,60 @@ func (a *Agent) transcribeVoice(ctx context.Context, fileID string) (string, err
 }
 
 // handleSubAgentResult processes the result of a completed sub-agent.
+// Sends result summary to owner via Telegram and logs to memory.
 func (a *Agent) handleSubAgentResult(ctx context.Context, result subagent.SubAgentResult) {
 	slog.Info("sub-agent completed",
 		"component", "agent", "operation", "handle_sub_agent_result",
 		"task_id", result.TaskID, "timed_out", result.TimedOut,
 		"has_result", result.ResultContent != "")
 
-	var entry string
-	if result.TimedOut {
+	var memoryEntry string
+	var telegramMsg string
+
+	switch {
+	case result.TimedOut && result.ResultContent != "":
+		memoryEntry = fmt.Sprintf("Sub-agent '%s' timed out but partial result collected (%d bytes).", result.TaskID, len(result.ResultContent))
+		content := truncateForTelegram(result.ResultContent)
+		telegramMsg = fmt.Sprintf("[Sub-agent '%s' timed out — partial result]\n\n%s", result.TaskID, content)
+	case result.TimedOut:
+		memoryEntry = fmt.Sprintf("Sub-agent '%s' timed out. No result collected.", result.TaskID)
+		telegramMsg = fmt.Sprintf("[Sub-agent '%s' timed out — no result produced]", result.TaskID)
+	case result.Err != nil:
+		memoryEntry = fmt.Sprintf("Sub-agent '%s' failed: %s", result.TaskID, result.Err)
+		telegramMsg = fmt.Sprintf("[Sub-agent '%s' failed: %s]", result.TaskID, result.Err)
+	default:
+		memoryEntry = fmt.Sprintf("Sub-agent '%s' completed successfully.", result.TaskID)
 		if result.ResultContent != "" {
-			entry = fmt.Sprintf("Sub-agent '%s' timed out but partial result collected (%d bytes).", result.TaskID, len(result.ResultContent))
+			content := truncateForTelegram(result.ResultContent)
+			telegramMsg = fmt.Sprintf("[Sub-agent '%s' completed]\n\n%s", result.TaskID, content)
 		} else {
-			entry = fmt.Sprintf("Sub-agent '%s' timed out. No result collected.", result.TaskID)
+			telegramMsg = fmt.Sprintf("[Sub-agent '%s' completed — no output produced]", result.TaskID)
 		}
-	} else if result.Err != nil {
-		entry = fmt.Sprintf("Sub-agent '%s' failed: %s", result.TaskID, result.Err)
-	} else {
-		entry = fmt.Sprintf("Sub-agent '%s' completed successfully.", result.TaskID)
 	}
-	a.logMemory(ctx, "sub-agent-result", entry)
+
+	a.logMemory(ctx, "sub-agent-result", memoryEntry)
+
+	// Send to Telegram if sender is available (not in sub-agent mode).
+	if a.sender != nil {
+		for _, id := range a.ownerIDs {
+			if err := a.sender.Send(ctx, id, telegramMsg); err != nil {
+				slog.Error("failed to send sub-agent result to Telegram",
+					"component", "agent", "operation", "handle_sub_agent_result",
+					"task_id", result.TaskID, "chat_id", id, "error", err)
+			}
+		}
+	}
+}
+
+// truncateForTelegram limits text to a reasonable Telegram message size.
+// Uses rune count to avoid splitting multi-byte UTF-8 characters.
+func truncateForTelegram(text string) string {
+	const maxRunes = 3500 // Telegram max is 4096, leave room for prefix
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes]) + "\n\n[...truncated]"
 }
 
 // RunSubAgent runs the agent in autonomous sub-agent mode.
