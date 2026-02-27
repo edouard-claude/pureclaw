@@ -33,7 +33,7 @@ internal/
   agent/                # Main agent loop: Telegram poll → context build → Mistral call → tool exec → respond
   config/               # config.json loading/saving (workspace path, models, heartbeat interval)
   vault/                # Encrypted keychain (AES-256-GCM + PBKDF2-SHA256 via x/crypto)
-  mistral/              # Mistral API client (chat completions + audio transcription), raw net/http
+  llm/                  # Mistral API client (chat completions + audio transcription), raw net/http
   telegram/             # Telegram Bot API client (long polling, send message, file download)
   memory/               # File-based memory: write/read/search/compact (memory/YYYY/MM/DD/HH.md)
   workspace/            # Workspace file operations (read/write AGENT.md, SOUL.md, HEARTBEAT.md, skills)
