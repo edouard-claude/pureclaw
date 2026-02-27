@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -1406,5 +1407,414 @@ func TestRun_NilFileChanges(t *testing.T) {
 	}
 	if sender.sent[0].text != "hello" {
 		t.Errorf("expected text %q, got %q", "hello", sender.sent[0].text)
+	}
+}
+
+// --- Voice transcription test doubles ---
+
+type fakeTranscriber struct {
+	text string
+	err  error
+	calls []struct {
+		audioData []byte
+		filename  string
+	}
+}
+
+func (f *fakeTranscriber) Transcribe(ctx context.Context, audioData []byte, filename string) (string, error) {
+	f.calls = append(f.calls, struct {
+		audioData []byte
+		filename  string
+	}{audioData, filename})
+	return f.text, f.err
+}
+
+type fakeVoiceDownloader struct {
+	filePath    string
+	getFileErr  error
+	fileData    []byte
+	downloadErr error
+	getFileCalls    []string
+	downloadCalls   []string
+}
+
+func (f *fakeVoiceDownloader) GetFile(ctx context.Context, fileID string) (string, error) {
+	f.getFileCalls = append(f.getFileCalls, fileID)
+	return f.filePath, f.getFileErr
+}
+
+func (f *fakeVoiceDownloader) DownloadFile(ctx context.Context, filePath string) ([]byte, error) {
+	f.downloadCalls = append(f.downloadCalls, filePath)
+	return f.fileData, f.downloadErr
+}
+
+func voiceMsg(chatID int64, fileID string, duration int) telegram.TelegramMessage {
+	return telegram.TelegramMessage{
+		Message: telegram.Message{
+			Chat:  telegram.Chat{ID: chatID},
+			Voice: &telegram.Voice{FileID: fileID, Duration: duration},
+		},
+	}
+}
+
+// --- Voice transcription tests ---
+
+func TestHandleMessage_VoiceTranscription(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "Bonjour!")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+	transcriber := &fakeTranscriber{text: "Salut comment ca va"}
+	downloader := &fakeVoiceDownloader{filePath: "voice/file.oga", fileData: []byte("ogg-data")}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		Transcriber:     transcriber,
+		VoiceDownloader: downloader,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "AwACAgI123", 5))
+	cancel()
+	<-done
+
+	// Verify transcription was called.
+	if len(transcriber.calls) != 1 {
+		t.Fatalf("transcriber calls = %d, want 1", len(transcriber.calls))
+	}
+	if string(transcriber.calls[0].audioData) != "ogg-data" {
+		t.Errorf("audio data = %q, want ogg-data", string(transcriber.calls[0].audioData))
+	}
+
+	// Verify downloader was called.
+	if len(downloader.getFileCalls) != 1 {
+		t.Fatalf("getFile calls = %d, want 1", len(downloader.getFileCalls))
+	}
+	if downloader.getFileCalls[0] != "AwACAgI123" {
+		t.Errorf("getFile fileID = %q, want AwACAgI123", downloader.getFileCalls[0])
+	}
+
+	// Verify LLM was called with transcribed text.
+	if len(llmFake.calls) != 1 {
+		t.Fatalf("LLM calls = %d, want 1", len(llmFake.calls))
+	}
+	// The user message should contain transcribed text.
+	lastMsg := llmFake.calls[0][len(llmFake.calls[0])-1]
+	if lastMsg.Content != "Salut comment ca va" {
+		t.Errorf("LLM user message = %q, want 'Salut comment ca va'", lastMsg.Content)
+	}
+
+	// Verify response was sent.
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(sender.sent))
+	}
+	if sender.sent[0].text != "Bonjour!" {
+		t.Errorf("sent text = %q, want 'Bonjour!'", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_VoiceDownloadFailure(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	transcriber := &fakeTranscriber{text: "text"}
+	downloader := &fakeVoiceDownloader{getFileErr: errors.New("network error")}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Transcriber:     transcriber,
+		VoiceDownloader: downloader,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "bad-file", 3))
+	cancel()
+	<-done
+
+	// LLM should NOT be called.
+	if len(llmFake.calls) != 0 {
+		t.Errorf("LLM calls = %d, want 0 (download failed)", len(llmFake.calls))
+	}
+
+	// Error message should be sent to owner.
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1 (error notification)", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "Failed to transcribe voice message") {
+		t.Errorf("sent text = %q, want to contain 'Failed to transcribe voice message'", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_VoiceTranscriptionFailure(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	transcriber := &fakeTranscriber{err: errors.New("API error")}
+	downloader := &fakeVoiceDownloader{filePath: "voice/file.oga", fileData: []byte("audio")}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Transcriber:     transcriber,
+		VoiceDownloader: downloader,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "file-id", 5))
+	cancel()
+	<-done
+
+	if len(llmFake.calls) != 0 {
+		t.Errorf("LLM calls = %d, want 0 (transcription failed)", len(llmFake.calls))
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "Failed to transcribe voice message") {
+		t.Errorf("sent text = %q, want to contain 'Failed to transcribe voice message'", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_VoiceNilTranscriber(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+
+	ag := New(NewAgentConfig{
+		Workspace: ws,
+		LLM:       llmFake,
+		Sender:    sender,
+		// No Transcriber or VoiceDownloader.
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "file-id", 3))
+	cancel()
+	<-done
+
+	if len(llmFake.calls) != 0 {
+		t.Errorf("LLM calls = %d, want 0 (nil transcriber)", len(llmFake.calls))
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1 (error notification)", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "not configured") {
+		t.Errorf("sent text = %q, want to contain 'not configured'", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_VoiceNilDownloader(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	transcriber := &fakeTranscriber{text: "text"}
+
+	ag := New(NewAgentConfig{
+		Workspace:   ws,
+		LLM:         llmFake,
+		Sender:      sender,
+		Transcriber: transcriber,
+		// No VoiceDownloader.
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "file-id", 3))
+	cancel()
+	<-done
+
+	if len(llmFake.calls) != 0 {
+		t.Errorf("LLM calls = %d, want 0 (nil downloader)", len(llmFake.calls))
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(sender.sent))
+	}
+	if !strings.Contains(sender.sent[0].text, "not configured") {
+		t.Errorf("sent text = %q, want to contain 'not configured'", sender.sent[0].text)
+	}
+}
+
+func TestHandleMessage_TextUnchanged(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "reply")}}
+	sender := &fakeSender{}
+	transcriber := &fakeTranscriber{text: "should not be called"}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Transcriber:     transcriber,
+		VoiceDownloader: &fakeVoiceDownloader{},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, testMsg(42, "normal text message"))
+	cancel()
+	<-done
+
+	// Transcriber should NOT be called for text messages.
+	if len(transcriber.calls) != 0 {
+		t.Errorf("transcriber calls = %d, want 0 (text message, no voice)", len(transcriber.calls))
+	}
+
+	// LLM should be called with the text message.
+	if len(llmFake.calls) != 1 {
+		t.Fatalf("LLM calls = %d, want 1", len(llmFake.calls))
+	}
+	lastMsg := llmFake.calls[0][len(llmFake.calls[0])-1]
+	if lastMsg.Content != "normal text message" {
+		t.Errorf("LLM user message = %q, want 'normal text message'", lastMsg.Content)
+	}
+}
+
+func TestTranscribeVoice_FullFlow(t *testing.T) {
+	transcriber := &fakeTranscriber{text: "transcribed text"}
+	downloader := &fakeVoiceDownloader{filePath: "voice/file.oga", fileData: []byte("audio-bytes")}
+
+	ag := &Agent{
+		transcriber:     transcriber,
+		voiceDownloader: downloader,
+	}
+
+	text, err := ag.transcribeVoice(context.Background(), "AwACAgI123")
+	if err != nil {
+		t.Fatalf("transcribeVoice: %v", err)
+	}
+	if text != "transcribed text" {
+		t.Errorf("text = %q, want 'transcribed text'", text)
+	}
+
+	// Verify download flow.
+	if len(downloader.getFileCalls) != 1 || downloader.getFileCalls[0] != "AwACAgI123" {
+		t.Errorf("getFile calls = %v, want [AwACAgI123]", downloader.getFileCalls)
+	}
+	if len(downloader.downloadCalls) != 1 || downloader.downloadCalls[0] != "voice/file.oga" {
+		t.Errorf("download calls = %v, want [voice/file.oga]", downloader.downloadCalls)
+	}
+
+	// Verify transcriber received audio bytes.
+	if len(transcriber.calls) != 1 {
+		t.Fatalf("transcriber calls = %d, want 1", len(transcriber.calls))
+	}
+	if string(transcriber.calls[0].audioData) != "audio-bytes" {
+		t.Errorf("transcriber audioData = %q, want 'audio-bytes'", string(transcriber.calls[0].audioData))
+	}
+	if transcriber.calls[0].filename != "voice.ogg" {
+		t.Errorf("transcriber filename = %q, want 'voice.ogg'", transcriber.calls[0].filename)
+	}
+}
+
+func TestHandleMessage_VoiceLoggedToMemory(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "reply")}}
+	sender := &fakeSender{}
+	mem := &fakeMemoryWriter{}
+	transcriber := &fakeTranscriber{text: "voice message content"}
+	downloader := &fakeVoiceDownloader{filePath: "voice/file.oga", fileData: []byte("audio")}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Memory:          mem,
+		Transcriber:     transcriber,
+		VoiceDownloader: downloader,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "file-id", 3))
+	cancel()
+	<-done
+
+	// Memory should log the transcribed text with source "voice-transcription".
+	var voiceEntry *memoryEntry
+	for _, e := range mem.entries {
+		if e.source == "voice-transcription" {
+			voiceEntry = &e
+			break
+		}
+	}
+	if voiceEntry == nil {
+		t.Fatal("expected voice-transcription memory entry for voice transcription")
+	}
+	if voiceEntry.content != "voice message content" {
+		t.Errorf("voice-transcription memory content = %q, want 'voice message content'", voiceEntry.content)
+	}
+}
+
+func TestHandleMessage_VoiceEmptyTranscription(t *testing.T) {
+	ws := testWorkspace(t)
+	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("message", "hello")}}
+	sender := &fakeSender{}
+	transcriber := &fakeTranscriber{text: ""} // Empty transcription.
+	downloader := &fakeVoiceDownloader{filePath: "voice/file.oga", fileData: []byte("audio")}
+
+	ag := New(NewAgentConfig{
+		Workspace:       ws,
+		LLM:             llmFake,
+		Sender:          sender,
+		Transcriber:     transcriber,
+		VoiceDownloader: downloader,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	messages := make(chan telegram.TelegramMessage, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- ag.Run(ctx, messages) }()
+
+	sendAndWait(t, messages, voiceMsg(42, "file-id", 3))
+	cancel()
+	<-done
+
+	// LLM should NOT be called (empty transcription guard).
+	if len(llmFake.calls) != 0 {
+		t.Errorf("LLM calls = %d, want 0 (empty transcription)", len(llmFake.calls))
+	}
+
+	// No error message sent either (empty is not an error, just skip).
+	if len(sender.sent) != 0 {
+		t.Errorf("sent messages = %d, want 0 (empty transcription skipped)", len(sender.sent))
 	}
 }

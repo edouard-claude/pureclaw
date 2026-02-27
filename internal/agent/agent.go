@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -50,6 +51,17 @@ type HeartbeatExecutor interface {
 	Execute(ctx context.Context, heartbeatContent string) error
 }
 
+// Transcriber abstracts the audio transcription provider for testability.
+type Transcriber interface {
+	Transcribe(ctx context.Context, audioData []byte, filename string) (string, error)
+}
+
+// VoiceDownloader abstracts the Telegram voice file download for testability.
+type VoiceDownloader interface {
+	GetFile(ctx context.Context, fileID string) (string, error)
+	DownloadFile(ctx context.Context, filePath string) ([]byte, error)
+}
+
 // NewAgentConfig holds all dependencies for Agent construction.
 type NewAgentConfig struct {
 	Workspace      *workspace.Workspace
@@ -58,9 +70,11 @@ type NewAgentConfig struct {
 	Memory         MemoryWriter
 	MemorySearcher MemorySearcher
 	ToolExecutor   ToolExecutor
-	FileChanges    <-chan struct{}
-	HeartbeatTick  <-chan time.Time
-	Heartbeat      HeartbeatExecutor
+	FileChanges     <-chan struct{}
+	HeartbeatTick   <-chan time.Time
+	Heartbeat       HeartbeatExecutor
+	Transcriber     Transcriber
+	VoiceDownloader VoiceDownloader
 }
 
 // Agent orchestrates the event loop: receives messages, calls LLM, sends responses.
@@ -71,24 +85,28 @@ type Agent struct {
 	memory         MemoryWriter
 	memorySearcher MemorySearcher
 	toolExecutor   ToolExecutor
-	fileChanges    <-chan struct{}
-	heartbeatTick  <-chan time.Time
-	heartbeat      HeartbeatExecutor
-	history        []llm.Message
+	fileChanges     <-chan struct{}
+	heartbeatTick   <-chan time.Time
+	heartbeat       HeartbeatExecutor
+	transcriber     Transcriber
+	voiceDownloader VoiceDownloader
+	history         []llm.Message
 }
 
 // New creates a new Agent with the given dependencies.
 func New(cfg NewAgentConfig) *Agent {
 	return &Agent{
-		workspace:      cfg.Workspace,
-		llm:            cfg.LLM,
-		sender:         cfg.Sender,
-		memory:         cfg.Memory,
-		memorySearcher: cfg.MemorySearcher,
-		toolExecutor:   cfg.ToolExecutor,
-		fileChanges:    cfg.FileChanges,
-		heartbeatTick:  cfg.HeartbeatTick,
-		heartbeat:      cfg.Heartbeat,
+		workspace:       cfg.Workspace,
+		llm:             cfg.LLM,
+		sender:          cfg.Sender,
+		memory:          cfg.Memory,
+		memorySearcher:  cfg.MemorySearcher,
+		toolExecutor:    cfg.ToolExecutor,
+		fileChanges:     cfg.FileChanges,
+		heartbeatTick:   cfg.HeartbeatTick,
+		heartbeat:       cfg.Heartbeat,
+		transcriber:     cfg.Transcriber,
+		voiceDownloader: cfg.VoiceDownloader,
 	}
 }
 
@@ -122,7 +140,7 @@ func (a *Agent) Run(ctx context.Context, messages <-chan telegram.TelegramMessag
 // handleMessage processes a single incoming Telegram message through the LLM pipeline.
 func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage) {
 	// Skip zero-value messages (closed channel).
-	if msg.Message.Text == "" && msg.Message.Chat.ID == 0 {
+	if msg.Message.Text == "" && msg.Message.Voice == nil && msg.Message.Chat.ID == 0 {
 		slog.Debug("skipping empty message", "component", "agent", "operation", "handle_message")
 		return
 	}
@@ -133,9 +151,40 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 		"chat_id", msg.Message.Chat.ID,
 	)
 
-	a.logMemory(ctx, "owner", msg.Message.Text)
+	// Determine user text — either from text or voice transcription.
+	userText := msg.Message.Text
+	if msg.Message.Voice != nil {
+		transcribed, err := a.transcribeVoice(ctx, msg.Message.Voice.FileID)
+		if err != nil {
+			slog.Error("voice transcription failed",
+				"component", "agent",
+				"operation", "transcribe_voice",
+				"error", err,
+			)
+			a.sender.Send(ctx, msg.Message.Chat.ID,
+				fmt.Sprintf("Failed to transcribe voice message: %v", err))
+			return
+		}
+		userText = transcribed
+		slog.Info("voice message transcribed",
+			"component", "agent",
+			"operation", "transcribe_voice",
+			"duration", msg.Message.Voice.Duration,
+		)
+	}
 
-	msgs := a.buildMessages(msg.Message.Text)
+	// Skip if still no text after voice transcription.
+	if userText == "" {
+		return
+	}
+
+	if msg.Message.Voice != nil {
+		a.logMemory(ctx, "voice-transcription", userText)
+	} else {
+		a.logMemory(ctx, "owner", userText)
+	}
+
+	msgs := a.buildMessages(userText)
 	tools := a.toolDefinitions()
 
 	var resp *llm.ChatResponse
@@ -215,7 +264,7 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 			)
 		}
 		a.logMemory(ctx, "agent", agentResp.Content)
-		a.addToHistory(msg.Message.Text, agentResp.Content)
+		a.addToHistory(userText, agentResp.Content)
 	case "think":
 		slog.Debug("think response",
 			"component", "agent",
@@ -321,6 +370,30 @@ func (a *Agent) handleHeartbeat(ctx context.Context) {
 			"error", err,
 		)
 	}
+}
+
+// transcribeVoice downloads a voice file from Telegram and transcribes it via the Voxtral API.
+func (a *Agent) transcribeVoice(ctx context.Context, fileID string) (string, error) {
+	if a.voiceDownloader == nil || a.transcriber == nil {
+		return "", fmt.Errorf("voice transcription not configured")
+	}
+
+	filePath, err := a.voiceDownloader.GetFile(ctx, fileID)
+	if err != nil {
+		return "", fmt.Errorf("get voice file path: %w", err)
+	}
+
+	audioData, err := a.voiceDownloader.DownloadFile(ctx, filePath)
+	if err != nil {
+		return "", fmt.Errorf("download voice file: %w", err)
+	}
+
+	text, err := a.transcriber.Transcribe(ctx, audioData, "voice.ogg")
+	if err != nil {
+		return "", fmt.Errorf("transcribe audio: %w", err)
+	}
+
+	return text, nil
 }
 
 func (a *Agent) logMemory(ctx context.Context, source, content string) {

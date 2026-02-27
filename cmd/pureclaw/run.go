@@ -30,8 +30,9 @@ var (
 	vaultDeriveKey = vault.DeriveKey
 	vaultOpenFn   = vault.Open
 	workspaceLoad = workspace.Load
-	newLLMClient  = func(apiKey, model string) agent.LLMClient { return llm.NewClient(apiKey, model) }
-	newTGClient   = telegram.NewClient
+	newLLMClient   = func(apiKey, model string) agent.LLMClient { return llm.NewClient(apiKey, model) }
+	newAudioClient = func(apiKey, model string) agent.Transcriber { return llm.NewClient(apiKey, model) }
+	newTGClient    = telegram.NewClient
 	newPoller     = func(client *telegram.Client, allowedIDs []int64, timeout int) *telegram.Poller {
 		return telegram.NewPoller(client, allowedIDs, timeout)
 	}
@@ -132,6 +133,7 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 
 	// 6a. Create clients
 	llmClient := newLLMClient(mistralKey, cfg.ModelText)
+	audioClient := newAudioClient(mistralKey, cfg.ModelAudio)
 	tgClient := newTGClient(telegramToken)
 	poller := newPoller(tgClient, cfg.TelegramAllowedIDs, 30)
 	sender := newSender(tgClient)
@@ -183,15 +185,17 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 
 	// 7. Create agent
 	ag := newAgent(agent.NewAgentConfig{
-		Workspace:      ws,
-		LLM:            llmClient,
-		Sender:         sender,
-		Memory:         mem,
-		MemorySearcher: mem,
-		ToolExecutor:   registry,
-		FileChanges:    fileChanges,
-		HeartbeatTick:  heartbeatTick,
-		Heartbeat:      hb,
+		Workspace:       ws,
+		LLM:             llmClient,
+		Sender:          sender,
+		Memory:          mem,
+		MemorySearcher:  mem,
+		ToolExecutor:    registry,
+		FileChanges:     fileChanges,
+		HeartbeatTick:   heartbeatTick,
+		Heartbeat:       hb,
+		Transcriber:     audioClient,
+		VoiceDownloader: tgClient,
 	})
 
 	// 8. Signal handling
