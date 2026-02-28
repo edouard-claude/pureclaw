@@ -22,8 +22,9 @@ func (s *Sender) Send(ctx context.Context, chatID int64, text string) error {
 	slog.Debug("sending message", "component", "telegram", "operation", "send", "chat_id", chatID)
 
 	body := sendMessageRequest{
-		ChatID: chatID,
-		Text:   text,
+		ChatID:    chatID,
+		Text:      text,
+		ParseMode: "HTML",
 	}
 
 	data, err := s.client.doPost(ctx, "sendMessage", body)
@@ -41,5 +42,32 @@ func (s *Sender) Send(ctx context.Context, chatID int64, text string) error {
 	}
 
 	slog.Debug("message sent", "component", "telegram", "operation", "send", "message_id", resp.Result.MessageID)
+	return nil
+}
+
+// React sets an emoji reaction on a message.
+func (s *Sender) React(ctx context.Context, chatID, messageID int64, emoji string) error {
+	slog.Debug("setting reaction", "component", "telegram", "operation", "react", "chat_id", chatID, "emoji", emoji)
+
+	body := setMessageReactionRequest{
+		ChatID:    chatID,
+		MessageID: messageID,
+		Reaction:  []reactionType{{Type: "emoji", Emoji: emoji}},
+	}
+
+	data, err := s.client.doPost(ctx, "setMessageReaction", body)
+	if err != nil {
+		return fmt.Errorf("telegram: react: %w", err)
+	}
+
+	var resp apiResponse[bool]
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("telegram: react: unmarshal: %w", err)
+	}
+
+	if !resp.Ok {
+		return fmt.Errorf("telegram: react: %s", resp.Description)
+	}
+
 	return nil
 }

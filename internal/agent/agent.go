@@ -30,6 +30,7 @@ type LLMClient interface {
 // Sender abstracts the Telegram message sender for testability.
 type Sender interface {
 	Send(ctx context.Context, chatID int64, text string) error
+	React(ctx context.Context, chatID, messageID int64, emoji string) error
 }
 
 // MemoryWriter abstracts the memory persistence layer for testability.
@@ -162,6 +163,13 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 		"chat_id", msg.Message.Chat.ID,
 	)
 
+	// Acknowledge receipt with a reaction emoji.
+	if a.sender != nil {
+		if err := a.sender.React(ctx, msg.Message.Chat.ID, msg.Message.MessageID, "\U0001F440"); err != nil {
+			slog.Debug("failed to set reaction", "component", "agent", "operation", "react", "error", err)
+		}
+	}
+
 	// Determine user text — either from text or voice transcription.
 	userText := msg.Message.Text
 	if msg.Message.Voice != nil {
@@ -233,7 +241,9 @@ func (a *Agent) handleMessage(ctx context.Context, msg telegram.TelegramMessage)
 		}
 
 		toolMsgs := a.executeToolCalls(ctx, resp.Choices[0].Message)
-		msgs = append(msgs, resp.Choices[0].Message)
+		assistantMsg := resp.Choices[0].Message
+		normalizeToolCallTypes(&assistantMsg)
+		msgs = append(msgs, assistantMsg)
 		msgs = append(msgs, toolMsgs...)
 
 		slog.Info("tool round completed",
@@ -504,7 +514,9 @@ func (a *Agent) RunSubAgent(ctx context.Context) error {
 		}
 
 		toolMsgs := a.executeToolCalls(ctx, resp.Choices[0].Message)
-		msgs = append(msgs, resp.Choices[0].Message)
+		assistantMsg := resp.Choices[0].Message
+		normalizeToolCallTypes(&assistantMsg)
+		msgs = append(msgs, assistantMsg)
 		msgs = append(msgs, toolMsgs...)
 
 		slog.Info("sub-agent tool round completed",
@@ -552,6 +564,16 @@ func (a *Agent) RunSubAgent(ctx context.Context) error {
 	slog.Info("sub-agent autonomous mode completed",
 		"component", "agent", "operation", "run_subagent")
 	return nil
+}
+
+// normalizeToolCallTypes ensures all tool calls have Type set to "function".
+// Some LLM providers omit the type field in responses; Mistral rejects empty type on re-send.
+func normalizeToolCallTypes(msg *llm.Message) {
+	for i := range msg.ToolCalls {
+		if msg.ToolCalls[i].Type == "" {
+			msg.ToolCalls[i].Type = "function"
+		}
+	}
 }
 
 func (a *Agent) logMemory(ctx context.Context, source, content string) {

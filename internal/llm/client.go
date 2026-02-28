@@ -40,14 +40,16 @@ func (e *httpError) IsRetryable() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
-// NewClient creates a new Mistral API client with HTTPS base URL and 10s timeout.
+// NewClient creates a new Mistral API client with HTTPS base URL and 30s timeout.
+// Mistral chat completions can take 10-20s on complex prompts with tools;
+// 30s provides headroom for slow networks (e.g. Raspberry Pi).
 func NewClient(apiKey, model string) *Client {
 	return &Client{
 		apiKey:  apiKey,
 		baseURL: "https://api.mistral.ai/v1/",
 		model:   model,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 30 * time.Second,
 		},
 	}
 }

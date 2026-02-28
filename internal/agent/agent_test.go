@@ -59,6 +59,10 @@ func (f *fakeSender) Send(ctx context.Context, chatID int64, text string) error 
 	return f.err
 }
 
+func (f *fakeSender) React(ctx context.Context, chatID, messageID int64, emoji string) error {
+	return nil
+}
+
 type memoryEntry struct {
 	source  string
 	content string
@@ -298,7 +302,8 @@ func TestRun_LLMError(t *testing.T) {
 	}
 }
 
-func TestRun_ParseError(t *testing.T) {
+func TestRun_PlainTextFallback(t *testing.T) {
+	// ParseAgentResponse wraps non-JSON text as a "message", so it gets sent.
 	ws := testWorkspace(t)
 	llmFake := &fakeLLM{
 		responses: []*llm.ChatResponse{{
@@ -321,8 +326,11 @@ func TestRun_ParseError(t *testing.T) {
 	cancel()
 	<-done
 
-	if len(sender.sent) != 0 {
-		t.Fatalf("expected no sends on parse error, got %d", len(sender.sent))
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 send (plain text fallback), got %d", len(sender.sent))
+	}
+	if sender.sent[0].text != "not json" {
+		t.Errorf("expected fallback text 'not json', got %q", sender.sent[0].text)
 	}
 }
 
@@ -495,7 +503,8 @@ func TestRun_ToolCallsReturned(t *testing.T) {
 	}
 }
 
-func TestRun_UnknownResponseType(t *testing.T) {
+func TestRun_UnknownResponseTypeFallback(t *testing.T) {
+	// Unknown type in JSON falls back to message (raw JSON sent as text).
 	ws := testWorkspace(t)
 	llmFake := &fakeLLM{responses: []*llm.ChatResponse{makeResponse("unknown_type", "data")}}
 	sender := &fakeSender{}
@@ -511,9 +520,9 @@ func TestRun_UnknownResponseType(t *testing.T) {
 	cancel()
 	<-done
 
-	// Should not send anything for unknown type.
-	if len(sender.sent) != 0 {
-		t.Fatalf("expected 0 sends for unknown type, got %d", len(sender.sent))
+	// ParseAgentResponse wraps unknown type as message with the raw JSON as content.
+	if len(sender.sent) != 1 {
+		t.Fatalf("expected 1 send (unknown type fallback), got %d", len(sender.sent))
 	}
 }
 

@@ -25,12 +25,14 @@ var httpDo = func(client *http.Client, req *http.Request) (*http.Response, error
 }
 
 // NewClient creates a new Telegram Bot API client.
+// The HTTP timeout is set to 40s to accommodate Telegram long polling (30s server-side timeout)
+// with headroom for network latency. Per-request context deadlines further control individual calls.
 func NewClient(token string) *Client {
 	return &Client{
 		token:   token,
 		baseURL: "https://api.telegram.org/bot" + token + "/",
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 40 * time.Second,
 		},
 	}
 }

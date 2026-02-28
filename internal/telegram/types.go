@@ -49,6 +49,19 @@ type sendMessageRequest struct {
 	ParseMode string `json:"parse_mode,omitempty"`
 }
 
+// setMessageReactionRequest is the JSON body for the setMessageReaction API call.
+type setMessageReactionRequest struct {
+	ChatID    int64          `json:"chat_id"`
+	MessageID int64          `json:"message_id"`
+	Reaction  []reactionType `json:"reaction"`
+}
+
+// reactionType represents a ReactionTypeEmoji.
+type reactionType struct {
+	Type  string `json:"type"`
+	Emoji string `json:"emoji"`
+}
+
 // TelegramMessage carries a validated message to the event loop.
 type TelegramMessage struct {
 	Message Message

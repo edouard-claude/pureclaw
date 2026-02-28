@@ -334,7 +334,8 @@ func TestExecute_NoChoices(t *testing.T) {
 	}
 }
 
-func TestExecute_ParseError(t *testing.T) {
+func TestExecute_PlainTextFallback(t *testing.T) {
+	// ParseAgentResponse wraps non-JSON text as a "message", so it gets sent.
 	l := &fakeLLM{resp: &llm.ChatResponse{
 		Choices: []llm.Choice{{
 			Message:      llm.Message{Content: "not valid json"},
@@ -346,11 +347,14 @@ func TestExecute_ParseError(t *testing.T) {
 	e := NewExecutor(l, s, m, []int64{42})
 
 	err := e.Execute(context.Background(), "Check stuff")
-	if err == nil {
-		t.Fatal("expected error for parse failure, got nil")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "parse response") {
-		t.Errorf("expected error about parse response, got %q", err.Error())
+	if len(s.sent) != 1 {
+		t.Fatalf("expected 1 send (plain text fallback), got %d", len(s.sent))
+	}
+	if s.sent[0].text != "not valid json" {
+		t.Errorf("expected fallback text, got %q", s.sent[0].text)
 	}
 }
 

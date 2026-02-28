@@ -38,8 +38,8 @@ func TestChatCompletion_Success(t *testing.T) {
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatalf("unmarshal request: %v", err)
 		}
-		if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_object" {
-			t.Error("missing json_object response_format")
+		if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_schema" {
+			t.Errorf("ResponseFormat.Type = %v, want json_schema", req.ResponseFormat)
 		}
 		if req.Model != "test-model" {
 			t.Errorf("model = %q, want test-model", req.Model)
@@ -228,8 +228,17 @@ func TestChatCompletion_ResponseFormatInRequest(t *testing.T) {
 	if gotReq.ResponseFormat == nil {
 		t.Fatal("ResponseFormat is nil")
 	}
-	if gotReq.ResponseFormat.Type != "json_object" {
-		t.Errorf("ResponseFormat.Type = %q, want json_object", gotReq.ResponseFormat.Type)
+	if gotReq.ResponseFormat.Type != "json_schema" {
+		t.Errorf("ResponseFormat.Type = %q, want json_schema", gotReq.ResponseFormat.Type)
+	}
+	if gotReq.ResponseFormat.JSONSchema == nil {
+		t.Fatal("ResponseFormat.JSONSchema is nil")
+	}
+	if gotReq.ResponseFormat.JSONSchema.Name != "agent_response" {
+		t.Errorf("JSONSchema.Name = %q, want agent_response", gotReq.ResponseFormat.JSONSchema.Name)
+	}
+	if !gotReq.ResponseFormat.JSONSchema.Strict {
+		t.Error("JSONSchema.Strict should be true")
 	}
 }
 
@@ -303,24 +312,13 @@ func TestChatCompletionWithRetry_Success(t *testing.T) {
 	}
 }
 
-func TestChatCompletionWithRetry_MalformedRetrySucceeds(t *testing.T) {
-	callCount := 0
+func TestChatCompletionWithRetry_MalformedAccepted(t *testing.T) {
+	// ParseAgentResponse now handles non-JSON gracefully via fallback,
+	// so malformed content is accepted on the first call without retry.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		if callCount == 1 {
-			// First call: return malformed JSON content
-			json.NewEncoder(w).Encode(ChatResponse{
-				Choices: []Choice{{
-					Message:      Message{Role: "assistant", Content: `not valid json`},
-					FinishReason: "stop",
-				}},
-			})
-			return
-		}
-		// Second call: return valid response
 		json.NewEncoder(w).Encode(ChatResponse{
 			Choices: []Choice{{
-				Message:      Message{Role: "assistant", Content: `{"type":"message","content":"OK"}`},
+				Message:      Message{Role: "assistant", Content: `Let me help you with that`},
 				FinishReason: "stop",
 			}},
 		})
@@ -328,20 +326,6 @@ func TestChatCompletionWithRetry_MalformedRetrySucceeds(t *testing.T) {
 	defer srv.Close()
 
 	client := newTestClient(t, srv)
-
-	// Use a real-ish retry that calls fn multiple times
-	origRetry := retryFn
-	retryFn = func(_ context.Context, maxAttempts int, _ time.Duration, fn func() error) error {
-		var lastErr error
-		for range maxAttempts {
-			lastErr = fn()
-			if lastErr == nil {
-				return nil
-			}
-		}
-		return lastErr
-	}
-	defer func() { retryFn = origRetry }()
 
 	resp, err := client.ChatCompletionWithRetry(context.Background(), []Message{
 		{Role: "user", Content: "test"},
@@ -349,19 +333,21 @@ func TestChatCompletionWithRetry_MalformedRetrySucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChatCompletionWithRetry: %v", err)
 	}
-	if callCount != 2 {
-		t.Errorf("callCount = %d, want 2", callCount)
-	}
-	if resp.Choices[0].Message.Content != `{"type":"message","content":"OK"}` {
+	if resp.Choices[0].Message.Content != `Let me help you with that` {
 		t.Errorf("unexpected content: %s", resp.Choices[0].Message.Content)
 	}
+	// Caller uses ParseAgentResponse which will wrap this as {"type":"message","content":"Let me help you with that"}
 }
 
-func TestChatCompletionWithRetry_ExhaustsRetries(t *testing.T) {
+func TestChatCompletionWithRetry_PlainTextAccepted(t *testing.T) {
+	// ParseAgentResponse wraps non-JSON text as a "message" type,
+	// so even consistently non-JSON responses succeed.
+	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
 		json.NewEncoder(w).Encode(ChatResponse{
 			Choices: []Choice{{
-				Message:      Message{Role: "assistant", Content: `not valid json`},
+				Message:      Message{Role: "assistant", Content: `plain text response`},
 				FinishReason: "stop",
 			}},
 		})
@@ -370,32 +356,17 @@ func TestChatCompletionWithRetry_ExhaustsRetries(t *testing.T) {
 
 	client := newTestClient(t, srv)
 
-	callCount := 0
-	origRetry := retryFn
-	retryFn = func(_ context.Context, maxAttempts int, _ time.Duration, fn func() error) error {
-		var lastErr error
-		for range maxAttempts {
-			callCount++
-			lastErr = fn()
-			if lastErr == nil {
-				return nil
-			}
-		}
-		return lastErr
-	}
-	defer func() { retryFn = origRetry }()
-
-	_, err := client.ChatCompletionWithRetry(context.Background(), []Message{
+	resp, err := client.ChatCompletionWithRetry(context.Background(), []Message{
 		{Role: "user", Content: "test"},
 	}, nil)
-	if err == nil {
-		t.Fatal("expected error after exhausting retries")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if callCount != 3 {
-		t.Errorf("callCount = %d, want 3", callCount)
+	if callCount != 1 {
+		t.Errorf("callCount = %d, want 1 (no retries needed)", callCount)
 	}
-	if !strings.Contains(err.Error(), "llm: parse agent response:") {
-		t.Errorf("error = %q, want to contain 'llm: parse agent response:'", err.Error())
+	if resp.Choices[0].Message.Content != `plain text response` {
+		t.Errorf("unexpected content: %s", resp.Choices[0].Message.Content)
 	}
 }
 
@@ -557,7 +528,8 @@ func TestChatCompletionWithRetry_NonRetryableHTTPError(t *testing.T) {
 	}
 }
 
-func TestChatCompletionWithRetry_UnknownAgentType(t *testing.T) {
+func TestChatCompletionWithRetry_UnknownAgentTypeAccepted(t *testing.T) {
+	// ParseAgentResponse treats unknown types as plain text fallback (message type).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(ChatResponse{
 			Choices: []Choice{{
@@ -570,29 +542,15 @@ func TestChatCompletionWithRetry_UnknownAgentType(t *testing.T) {
 
 	client := newTestClient(t, srv)
 
-	callCount := 0
-	origRetry := retryFn
-	retryFn = func(_ context.Context, maxAttempts int, _ time.Duration, fn func() error) error {
-		var lastErr error
-		for range maxAttempts {
-			callCount++
-			lastErr = fn()
-			if lastErr == nil {
-				return nil
-			}
-		}
-		return lastErr
-	}
-	defer func() { retryFn = origRetry }()
-
-	_, err := client.ChatCompletionWithRetry(context.Background(), []Message{
+	resp, err := client.ChatCompletionWithRetry(context.Background(), []Message{
 		{Role: "user", Content: "test"},
 	}, nil)
-	if err == nil {
-		t.Fatal("expected error for unknown agent type")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unknown type") {
-		t.Errorf("error = %q, want to contain 'unknown type'", err.Error())
+	// The raw content is preserved; ParseAgentResponse (called by the agent) will wrap it.
+	if resp.Choices[0].Message.Content != `{"type":"action","content":"do something"}` {
+		t.Errorf("unexpected content: %s", resp.Choices[0].Message.Content)
 	}
 }
 

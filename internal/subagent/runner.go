@@ -88,6 +88,17 @@ func (r *Runner) LaunchSubAgent(ctx context.Context, cfg RunnerConfig, resultCh 
 	r.done = make(chan struct{})
 	r.mu.Unlock()
 
+	// Resolve to absolute path so the subprocess can find its workspace
+	// regardless of the parent's working directory.
+	absPath, err := filepath.Abs(cfg.WorkspacePath)
+	if err != nil {
+		r.mu.Lock()
+		r.active = false
+		r.mu.Unlock()
+		return fmt.Errorf("resolve workspace path: %w", err)
+	}
+	cfg.WorkspacePath = absPath
+
 	// Validate workspace exists.
 	if _, err := osStat(cfg.WorkspacePath); err != nil {
 		r.mu.Lock()
@@ -106,6 +117,25 @@ func (r *Runner) LaunchSubAgent(ctx context.Context, cfg RunnerConfig, resultCh 
 		r.mu.Unlock()
 		return fmt.Errorf("invalid workspace path: %w", err)
 	}
+
+	// Resolve config and vault to absolute paths for the subprocess.
+	absConfig, err := filepath.Abs(cfg.ConfigPath)
+	if err != nil {
+		r.mu.Lock()
+		r.active = false
+		r.mu.Unlock()
+		return fmt.Errorf("resolve config path: %w", err)
+	}
+	cfg.ConfigPath = absConfig
+
+	absVault, err := filepath.Abs(cfg.VaultPath)
+	if err != nil {
+		r.mu.Lock()
+		r.active = false
+		r.mu.Unlock()
+		return fmt.Errorf("resolve vault path: %w", err)
+	}
+	cfg.VaultPath = absVault
 
 	// Build subprocess command.
 	timeoutCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)

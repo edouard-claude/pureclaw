@@ -100,14 +100,17 @@ func runSubAgentCmd(workspacePath, configPath, vaultPath string, stdin io.Reader
 		return 1
 	}
 
-	// 3. Prompt for vault passphrase.
-	fmt.Fprint(stderr, "Vault passphrase: ")
-	scanner := bufio.NewScanner(stdin)
-	scanner.Scan()
-	passphrase := strings.TrimSpace(scanner.Text())
+	// 3. Get vault passphrase from env or interactive prompt.
+	passphrase := os.Getenv("PURECLAW_VAULT_PASSPHRASE")
 	if passphrase == "" {
-		fmt.Fprintln(stderr, "Error: passphrase cannot be empty")
-		return 1
+		fmt.Fprint(stderr, "Vault passphrase: ")
+		scanner := bufio.NewScanner(stdin)
+		scanner.Scan()
+		passphrase = strings.TrimSpace(scanner.Text())
+		if passphrase == "" {
+			fmt.Fprintln(stderr, "Error: passphrase cannot be empty")
+			return 1
+		}
 	}
 
 	// 4. Open vault.

@@ -1,6 +1,6 @@
 # Binaries
 /pureclaw
-/pureclaw-arm64
+/pureclaw-arm*
 *.exe
 
 # Test coverage

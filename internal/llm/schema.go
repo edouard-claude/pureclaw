@@ -2,7 +2,7 @@ package llm
 
 import (
 	"encoding/json"
-	"fmt"
+	"strings"
 )
 
 // ChatRequest represents a Mistral chat completion API request.
@@ -26,8 +26,18 @@ type Message struct {
 }
 
 // ResponseFormat specifies the desired response format from the API.
+// Supports "text", "json_object", and "json_schema" types.
 type ResponseFormat struct {
-	Type string `json:"type"`
+	Type       string      `json:"type"`
+	JSONSchema *JSONSchema `json:"json_schema,omitempty"`
+}
+
+// JSONSchema defines a strict JSON schema for structured output.
+type JSONSchema struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 // Tool represents a tool available for the model to call.
@@ -83,17 +93,45 @@ type AgentResponse struct {
 	Content string `json:"content"`
 }
 
-// ParseAgentResponse parses a JSON content string into an AgentResponse
-// and validates that the type field is one of message, think, or noop.
+// ParseAgentResponse parses an LLM content string into an AgentResponse.
+// It uses a 3-step strategy to handle models that don't always return strict JSON:
+//  1. Direct JSON parse (ideal case with json_schema enforcement)
+//  2. Extract embedded JSON from surrounding text (model added preamble/suffix)
+//  3. Fallback: wrap raw text as a "message" type response
 func ParseAgentResponse(content string) (*AgentResponse, error) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return &AgentResponse{Type: "noop", Content: ""}, nil
+	}
+
+	// Step 1: try direct JSON parse.
+	if resp, ok := tryParseAgent(trimmed); ok {
+		return resp, nil
+	}
+
+	// Step 2: try to extract a JSON object from the text.
+	if start := strings.Index(trimmed, "{"); start >= 0 {
+		if end := strings.LastIndex(trimmed, "}"); end > start {
+			if resp, ok := tryParseAgent(trimmed[start : end+1]); ok {
+				return resp, nil
+			}
+		}
+	}
+
+	// Step 3: fallback — treat raw text as a message.
+	return &AgentResponse{Type: "message", Content: trimmed}, nil
+}
+
+// tryParseAgent attempts to unmarshal s as an AgentResponse and validates the type.
+func tryParseAgent(s string) (*AgentResponse, bool) {
 	var resp AgentResponse
-	if err := json.Unmarshal([]byte(content), &resp); err != nil {
-		return nil, fmt.Errorf("llm: parse agent response: %w", err)
+	if err := json.Unmarshal([]byte(s), &resp); err != nil {
+		return nil, false
 	}
 	switch resp.Type {
 	case "message", "think", "noop":
-		return &resp, nil
+		return &resp, true
 	default:
-		return nil, fmt.Errorf("llm: parse agent response: unknown type %q", resp.Type)
+		return nil, false
 	}
 }

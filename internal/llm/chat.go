@@ -14,20 +14,42 @@ import (
 // retryFn is a package-level variable for testability.
 var retryFn = platform.Retry
 
-// ChatCompletion sends a chat completion request to the Mistral API
-// with response_format set to json_object.
+// agentResponseSchema is the JSON Schema for structured agent responses,
+// enforced via Mistral's json_schema response_format with strict: true.
+var agentResponseSchema = json.RawMessage(`{
+	"type": "object",
+	"properties": {
+		"type": {"type": "string", "enum": ["message", "think", "noop"]},
+		"content": {"type": "string"}
+	},
+	"required": ["type", "content"],
+	"additionalProperties": false
+}`)
+
+// ChatCompletion sends a chat completion request to the Mistral API.
+// When tools are provided, response_format is omitted (Mistral rejects structured output + tools).
+// When no tools are provided, response_format uses json_schema with strict enforcement.
 func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error) {
 	slog.Debug("chat completion request", "component", "llm", "operation", "chat_completion", "model", c.model)
 
 	req := ChatRequest{
-		Model:          c.model,
-		Messages:       messages,
-		ResponseFormat: &ResponseFormat{Type: "json_object"},
+		Model:    c.model,
+		Messages: messages,
 	}
 
 	if len(tools) > 0 {
 		req.Tools = tools
 		req.ToolChoice = "auto"
+	} else {
+		req.ResponseFormat = &ResponseFormat{
+			Type: "json_schema",
+			JSONSchema: &JSONSchema{
+				Name:        "agent_response",
+				Description: "Agent response with type and content fields",
+				Schema:      agentResponseSchema,
+				Strict:      true,
+			},
+		}
 	}
 
 	data, err := c.doPost(ctx, "chat/completions", req)
@@ -43,8 +65,10 @@ func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools [
 	return &resp, nil
 }
 
-// ChatCompletionWithRetry wraps ChatCompletion with retry on JSON parse failure.
+// ChatCompletionWithRetry wraps ChatCompletion with retry on transient HTTP errors.
 // It retries up to 3 times with exponential backoff starting at 1s.
+// Note: ParseAgentResponse handles non-JSON text gracefully via fallback,
+// so JSON parse errors are NOT retried (they would produce the same result).
 func (c *Client) ChatCompletionWithRetry(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error) {
 	var chatResp *ChatResponse
 	var nonRetryErr error
@@ -57,21 +81,6 @@ func (c *Client) ChatCompletionWithRetry(ctx context.Context, messages []Message
 				return nil
 			}
 			return err
-		}
-
-		// Validate: if text response (not tool call), parse as AgentResponse
-		if len(resp.Choices) > 0 && resp.Choices[0].FinishReason != "tool_calls" {
-			content := resp.Choices[0].Message.Content
-			if content != "" {
-				if _, parseErr := ParseAgentResponse(content); parseErr != nil {
-					slog.Warn("malformed LLM response, retrying",
-						"component", "llm",
-						"operation", "chat_completion",
-						"error", parseErr,
-					)
-					return parseErr
-				}
-			}
 		}
 
 		chatResp = resp

@@ -327,22 +327,34 @@ func TestParseAgentResponse(t *testing.T) {
 			want:    &AgentResponse{Type: "noop", Content: ""},
 		},
 		{
-			name:    "unknown type",
+			name:    "unknown type falls back to message",
 			content: `{"type":"unknown","content":"test"}`,
-			wantErr: true,
-			errMsg:  "unknown type",
+			want:    &AgentResponse{Type: "message", Content: `{"type":"unknown","content":"test"}`},
 		},
 		{
-			name:    "malformed JSON",
+			name:    "malformed JSON falls back to message",
 			content: `not json at all`,
-			wantErr: true,
-			errMsg:  "parse agent response",
+			want:    &AgentResponse{Type: "message", Content: "not json at all"},
 		},
 		{
-			name:    "empty type",
+			name:    "empty type falls back to message",
 			content: `{"type":"","content":"test"}`,
-			wantErr: true,
-			errMsg:  "unknown type",
+			want:    &AgentResponse{Type: "message", Content: `{"type":"","content":"test"}`},
+		},
+		{
+			name:    "embedded JSON in text",
+			content: `Let me help you. {"type":"message","content":"Hello!"} Some extra text.`,
+			want:    &AgentResponse{Type: "message", Content: "Hello!"},
+		},
+		{
+			name:    "empty content returns noop",
+			content: ``,
+			want:    &AgentResponse{Type: "noop", Content: ""},
+		},
+		{
+			name:    "whitespace only returns noop",
+			content: `   `,
+			want:    &AgentResponse{Type: "noop", Content: ""},
 		},
 	}
 

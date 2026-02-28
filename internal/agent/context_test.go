@@ -38,7 +38,7 @@ func TestSystemPrompt_Format(t *testing.T) {
 	if !strings.Contains(prompt, `{"type": "noop"`) {
 		t.Error("expected system prompt to contain noop type example")
 	}
-	if !strings.Contains(prompt, "exactly one JSON object") {
+	if !strings.Contains(prompt, "single valid JSON object") {
 		t.Error("expected system prompt to contain JSON instruction")
 	}
 }

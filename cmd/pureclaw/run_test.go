@@ -75,6 +75,10 @@ func (s *stubSender) Send(ctx context.Context, chatID int64, text string) error 
 	return nil
 }
 
+func (s *stubSender) React(ctx context.Context, chatID, messageID int64, emoji string) error {
+	return nil
+}
+
 // fakeVault creates a real test vault in dir.
 func fakeVault(t *testing.T, dir string) {
 	t.Helper()

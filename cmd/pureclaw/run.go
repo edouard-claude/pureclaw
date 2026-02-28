@@ -65,14 +65,17 @@ func runAgent(stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// 2. Prompt for vault passphrase
-	fmt.Fprint(stderr, "Vault passphrase: ")
-	scanner := bufio.NewScanner(stdin)
-	scanner.Scan()
-	passphrase := strings.TrimSpace(scanner.Text())
+	// 2. Get vault passphrase from env or interactive prompt
+	passphrase := os.Getenv("PURECLAW_VAULT_PASSPHRASE")
 	if passphrase == "" {
-		fmt.Fprintln(stderr, "Error: passphrase cannot be empty")
-		return 1
+		fmt.Fprint(stderr, "Vault passphrase: ")
+		scanner := bufio.NewScanner(stdin)
+		scanner.Scan()
+		passphrase = strings.TrimSpace(scanner.Text())
+		if passphrase == "" {
+			fmt.Fprintln(stderr, "Error: passphrase cannot be empty")
+			return 1
+		}
 	}
 
 	// 3. Open vault
