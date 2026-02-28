@@ -9,6 +9,14 @@
 
 # pureclaw
 
+[![CI](https://github.com/edouard-claude/pureclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/edouard-claude/pureclaw/actions/workflows/ci.yml)
+[![Release](https://github.com/edouard-claude/pureclaw/actions/workflows/release.yml/badge.svg)](https://github.com/edouard-claude/pureclaw/actions/workflows/release.yml)
+[![codecov](https://codecov.io/gh/edouard-claude/pureclaw/branch/master/graph/badge.svg)](https://codecov.io/gh/edouard-claude/pureclaw)
+[![Go Report Card](https://goreportcard.com/badge/github.com/edouard-claude/pureclaw)](https://goreportcard.com/report/github.com/edouard-claude/pureclaw)
+[![GitHub release](https://img.shields.io/github/v/release/edouard-claude/pureclaw?include_prereleases)](https://github.com/edouard-claude/pureclaw/releases)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/edouard-claude/pureclaw)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **A self-contained LLM agent that fits in your pocket.**
 
 Single binary. Zero database. Runs on a Raspberry Pi.
@@ -43,41 +51,46 @@ Modern LLM agents require 16 GB of RAM, Docker, Redis, PostgreSQL and three YAML
 |---|---|
 | Language | Go 1.25, static binary, zero CGO |
 | LLM | Mistral (`mistral-large-latest` + `voxtral-mini-latest` for voice) |
-| Interface | Telegram Bot API (long polling) |
+| Interface | Telegram Bot API (long polling, HTML formatting) |
 | Storage | Markdown/JSON files on disk |
 | Crypto | AES-256-GCM + PBKDF2-SHA256 (`golang.org/x/crypto`) |
+| CI/CD | GitHub Actions + GoReleaser |
 | Dependencies | **1** (just `golang.org/x/crypto`) |
 
-## Quickstart
+## Install
 
-### Build
+### From releases
+
+Download the latest binary from [Releases](https://github.com/edouard-claude/pureclaw/releases):
+
+```bash
+# Linux amd64
+curl -L https://github.com/edouard-claude/pureclaw/releases/latest/download/pureclaw_linux_amd64.tar.gz | tar xz
+
+# Raspberry Pi (armv7)
+curl -L https://github.com/edouard-claude/pureclaw/releases/latest/download/pureclaw_linux_armv7.tar.gz | tar xz
+
+# macOS arm64
+curl -L https://github.com/edouard-claude/pureclaw/releases/latest/download/pureclaw_darwin_arm64.tar.gz | tar xz
+```
+
+### From source
 
 ```bash
 # Local build
 make build
 
-# Cross-compile for Raspberry Pi (ARM64)
+# Raspberry Pi (armv7l)
+make build-pi
+
+# Linux arm64
 make build-arm64
 
 # With version tag
-CGO_ENABLED=0 go build -ldflags "-X main.Version=1.0.0" -o pureclaw ./cmd/pureclaw/
+make build VERSION=1.0.0
 ```
 
-### Deploy to a Pi
-
-```bash
-# Cross-compile for ARM64
-make build-arm64
-
-# Copy the binary
-scp pureclaw-arm64 pi@raspberrypi:~/pureclaw
-
-# On the Pi
-ssh pi@raspberrypi
-chmod +x ~/pureclaw
-~/pureclaw init     # Interactive setup (API keys, Telegram token, etc.)
-~/pureclaw run      # Off you go
-```
+## Quickstart
 
 ### Init
 
@@ -99,6 +112,14 @@ This creates `config.json`, `vault.enc`, and the workspace with default files.
 ```bash
 ./pureclaw run                          # Main agent
 ./pureclaw run --agent agents/<id>      # Sub-agent (internal use)
+```
+
+### Deploy to a Pi
+
+```bash
+make build-pi
+scp pureclaw-arm7 kali@raspberrypi:~/pureclaw
+ssh kali@raspberrypi "chmod +x ~/pureclaw && ~/pureclaw init"
 ```
 
 ### Vault
@@ -165,14 +186,26 @@ internal/
 ```bash
 make test                               # Tests + coverage
 make coverage                           # Coverage report
+make vet                                # Static analysis
 go test -run TestVaultRoundTrip ./...   # Specific test
 ```
+
+## Releasing
+
+Releases are automated via GitHub Actions + GoReleaser. To create a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GoReleaser builds binaries for linux/darwin (amd64, arm64, armv7), creates a GitHub Release with checksums and changelog.
 
 ## Design constraints
 
 - **< 30 MB** RAM at rest
 - **4 goroutines** max: main + Telegram poller + heartbeat + 1 sub-agent
-- **10s timeout** on Mistral API calls, exponential backoff retry (max 3)
+- **30s timeout** on Mistral API calls, exponential backoff retry (max 3)
 - **No streaming** (unnecessary for Telegram)
 - Sub-agents: max depth 1, no Telegram access, 5 min timeout
 
