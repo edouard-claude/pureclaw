@@ -261,7 +261,11 @@ func TestPoller_Run_WhitelistRejection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	go p.Run(ctx, out)
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, out)
+		close(done)
+	}()
 
 	select {
 	case msg := <-out:
@@ -277,7 +281,7 @@ func TestPoller_Run_WhitelistRejection(t *testing.T) {
 
 	// Ensure only one message was sent (unauthorized was filtered)
 	cancel()
-	time.Sleep(50 * time.Millisecond)
+	<-done
 	if len(out) != 0 {
 		t.Errorf("unexpected extra messages in channel: %d", len(out))
 	}
@@ -344,7 +348,11 @@ func TestPoller_Run_OffsetAdvancement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	go p.Run(ctx, out)
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, out)
+		close(done)
+	}()
 
 	// Receive both messages
 	for i := range 2 {
@@ -358,6 +366,7 @@ func TestPoller_Run_OffsetAdvancement(t *testing.T) {
 	// Wait for the second poll to happen (verifying offset)
 	time.Sleep(200 * time.Millisecond)
 	cancel()
+	<-done
 }
 
 func TestPoller_Run_NilMessageSkipped(t *testing.T) {
@@ -408,7 +417,11 @@ func TestPoller_Run_NilMessageSkipped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	go p.Run(ctx, out)
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, out)
+		close(done)
+	}()
 
 	select {
 	case msg := <-out:
@@ -420,6 +433,7 @@ func TestPoller_Run_NilMessageSkipped(t *testing.T) {
 	}
 
 	cancel()
+	<-done
 }
 
 func TestPoller_Run_NetworkErrorRetry(t *testing.T) {
@@ -481,7 +495,11 @@ func TestPoller_Run_NetworkErrorRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	go p.Run(ctx, out)
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, out)
+		close(done)
+	}()
 
 	select {
 	case msg := <-out:
@@ -493,6 +511,7 @@ func TestPoller_Run_NetworkErrorRetry(t *testing.T) {
 	}
 
 	cancel()
+	<-done
 }
 
 func TestPoller_Run_ContextCancellation(t *testing.T) {
@@ -593,7 +612,11 @@ func TestPoller_Run_RetryExhaustedContinuesLoop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	go p.Run(ctx, out)
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, out)
+		close(done)
+	}()
 
 	select {
 	case msg := <-out:
@@ -605,6 +628,7 @@ func TestPoller_Run_RetryExhaustedContinuesLoop(t *testing.T) {
 	}
 
 	cancel()
+	<-done
 }
 
 func TestPoller_isAllowed(t *testing.T) {
@@ -688,7 +712,11 @@ func TestPoller_Run_NilFromRejected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	go p.Run(ctx, out)
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx, out)
+		close(done)
+	}()
 
 	select {
 	case msg := <-out:
@@ -696,6 +724,9 @@ func TestPoller_Run_NilFromRejected(t *testing.T) {
 	case <-ctx.Done():
 		// Expected: no messages passed through
 	}
+
+	// Wait for Run to finish before defers restore package-level vars.
+	<-done
 }
 
 func TestPoller_Run_ChannelFullContextCancel(t *testing.T) {
